@@ -20,9 +20,12 @@ def generate_launch_description():
     fx = LaunchConfiguration('fx', default=387.229248046875)
     fy = LaunchConfiguration('fy', default=387.229248046875)
     
-    max_vel = LaunchConfiguration('max_vel', default=2.0)
-    max_acc = LaunchConfiguration('max_acc', default=3.0)
+    max_vel = LaunchConfiguration('max_vel', default=0.7)
+    max_acc = LaunchConfiguration('max_acc', default=1.0)
     planning_horizon = LaunchConfiguration('planning_horizon', default=7.5)
+    obstacles_inflation = LaunchConfiguration('obstacles_inflation', default=0.55)
+    collision_dist0 = LaunchConfiguration('collision_dist0', default=1.0)
+    swarm_clearance = LaunchConfiguration('swarm_clearance', default=1.0)
     
     point_num = LaunchConfiguration('point_num', default=1)
     point0_x = LaunchConfiguration('point0_x', default=0.0)
@@ -63,6 +66,21 @@ def generate_launch_description():
     max_vel_arg = DeclareLaunchArgument('max_vel', default_value=max_vel, description='Maximum velocity')
     max_acc_arg = DeclareLaunchArgument('max_acc', default_value=max_acc, description='Maximum acceleration')
     planning_horizon_arg = DeclareLaunchArgument('planning_horizon', default_value=planning_horizon, description='Planning horizon')
+    obstacles_inflation_arg = DeclareLaunchArgument(
+        'obstacles_inflation',
+        default_value=obstacles_inflation,
+        description='Inflation radius for local map obstacles',
+    )
+    collision_dist0_arg = DeclareLaunchArgument(
+        'collision_dist0',
+        default_value=collision_dist0,
+        description='EGO collision cost target distance',
+    )
+    swarm_clearance_arg = DeclareLaunchArgument(
+        'swarm_clearance',
+        default_value=swarm_clearance,
+        description='EGO swarm clearance distance',
+    )
     
     point_num_arg = DeclareLaunchArgument('point_num', default_value=point_num, description='Number of waypoints')
     point0_x_arg = DeclareLaunchArgument('point0_x', default_value=point0_x, description='Waypoint 0 X coordinate')
@@ -145,7 +163,7 @@ def generate_launch_description():
             {'grid_map/local_update_range_x': 5.5},
             {'grid_map/local_update_range_y': 5.5},
             {'grid_map/local_update_range_z': 4.5},
-            {'grid_map/obstacles_inflation': 0.099},
+            {'grid_map/obstacles_inflation': obstacles_inflation},
             {'grid_map/local_map_margin': 10},
             {'grid_map/ground_height': -0.01},
             # camera parameter
@@ -189,8 +207,8 @@ def generate_launch_description():
             {'optimization/lambda_collision': 0.5},
             {'optimization/lambda_feasibility': 0.1},
             {'optimization/lambda_fitness': 1.0},
-            {'optimization/dist0': 0.5},
-            {'optimization/swarm_clearance': 0.5},
+            {'optimization/dist0': collision_dist0},
+            {'optimization/swarm_clearance': swarm_clearance},
             {'optimization/max_vel': max_vel},
             {'optimization/max_acc': max_acc},
 
@@ -224,6 +242,9 @@ def generate_launch_description():
     ld.add_action(max_vel_arg)
     ld.add_action(max_acc_arg)
     ld.add_action(planning_horizon_arg)
+    ld.add_action(obstacles_inflation_arg)
+    ld.add_action(collision_dist0_arg)
+    ld.add_action(swarm_clearance_arg)
     
     ld.add_action(point_num_arg)
     ld.add_action(point0_x_arg)

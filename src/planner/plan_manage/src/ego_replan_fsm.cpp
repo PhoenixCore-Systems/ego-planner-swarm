@@ -207,14 +207,15 @@ namespace ego_planner
       /*** FSM状态转换 ***/
       if (exec_state_ == WAIT_TARGET)
         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
+      else if (exec_state_ == EXEC_TRAJ)
+      {
+        changeFSMExecState(REPLAN_TRAJ, "TRIG");
+      }
       else
       {
-        while (exec_state_ != EXEC_TRAJ)
-        {
-          rclcpp::spin_some(node_);
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        changeFSMExecState(REPLAN_TRAJ, "TRIG");
+        RCLCPP_WARN(
+            node_->get_logger(),
+            "Received a waypoint while the planner is busy; deferring until the active replan finishes.");
       }
 
       visualization_->displayGlobalPathList(gloabl_traj, 0.1, 0);
