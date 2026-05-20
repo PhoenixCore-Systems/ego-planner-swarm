@@ -22,6 +22,8 @@ namespace ego_planner
     node_->declare_parameter("fsm/emergency_time", 1.0);
     node_->declare_parameter("fsm/realworld_experiment", false);
     node_->declare_parameter("fsm/fail_safe", true);
+    node_->declare_parameter("fsm/max_consecutive_plan_failures", 8);
+    node_->declare_parameter("fsm/plan_failure_retry_delay", 0.25);
 
     node_->get_parameter("fsm/flight_type", target_type_);
     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
@@ -31,6 +33,8 @@ namespace ego_planner
     node_->get_parameter("fsm/emergency_time", emergency_time_);
     node_->get_parameter("fsm/realworld_experiment", flag_realworld_experiment_);
     node_->get_parameter("fsm/fail_safe", enable_fail_safe_);
+    node_->get_parameter("fsm/max_consecutive_plan_failures", max_consecutive_plan_failures_);
+    node_->get_parameter("fsm/plan_failure_retry_delay", plan_failure_retry_delay_);
 
     have_trigger_ = !flag_realworld_experiment_;
 
@@ -203,6 +207,7 @@ namespace ego_planner
       end_vel_.setZero();
       have_target_ = true;
       have_new_target_ = true;
+      consecutive_plan_failures_ = 0;
 
       /*** FSM状态转换 ***/
       if (exec_state_ == WAIT_TARGET)
@@ -215,7 +220,9 @@ namespace ego_planner
       {
         RCLCPP_WARN(
             node_->get_logger(),
-            "Received a waypoint while the planner is busy; deferring until the active replan finishes.");
+            "Received a waypoint while the planner is busy; replacing the active target and restarting from the new global trajectory.");
+        changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
+        flag_escape_emergency_ = true;
       }
 
       visualization_->displayGlobalPathList(gloabl_traj, 0.1, 0);
@@ -242,7 +249,10 @@ namespace ego_planner
 
     init_pt_ = odom_pos_;
 
-    Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, 1.0);
+    Eigen::Vector3d end_wp(
+        msg->pose.position.x,
+        msg->pose.position.y,
+        std::max(0.0, static_cast<double>(msg->pose.position.z)));
 
     planNextWaypoint(end_wp);
   }
@@ -535,28 +545,65 @@ namespace ego_planner
       bool success = planFromGlobalTraj(10); // zx-todo
       if (success)
       {
+        consecutive_plan_failures_ = 0;
         changeFSMExecState(EXEC_TRAJ, "FSM");
         flag_escape_emergency_ = true;
         publishSwarmTrajs(false);
       }
       else
       {
-        changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        consecutive_plan_failures_++;
+        last_plan_failure_time_ = rclcpp::Clock().now();
+        if (consecutive_plan_failures_ >= max_consecutive_plan_failures_)
+        {
+          RCLCPP_WARN(
+              node_->get_logger(),
+              "Planner failed %d consecutive new-trajectory attempts; entering emergency stop until a safer target arrives.",
+              consecutive_plan_failures_);
+          flag_escape_emergency_ = true;
+          changeFSMExecState(EMERGENCY_STOP, "FSM");
+        }
+        else
+        {
+          changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        }
       }
       break;
     }
 
     case REPLAN_TRAJ:
     {
+      if (
+          consecutive_plan_failures_ >= max_consecutive_plan_failures_ &&
+          (rclcpp::Clock().now() - last_plan_failure_time_).seconds() < plan_failure_retry_delay_)
+      {
+        changeFSMExecState(EMERGENCY_STOP, "FSM");
+        break;
+      }
 
       if (planFromCurrentTraj(1))
       {
+        consecutive_plan_failures_ = 0;
         changeFSMExecState(EXEC_TRAJ, "FSM");
         publishSwarmTrajs(false);
       }
       else
       {
-        changeFSMExecState(REPLAN_TRAJ, "FSM");
+        consecutive_plan_failures_++;
+        last_plan_failure_time_ = rclcpp::Clock().now();
+        if (consecutive_plan_failures_ >= max_consecutive_plan_failures_)
+        {
+          RCLCPP_WARN(
+              node_->get_logger(),
+              "Planner failed %d consecutive replans; entering emergency stop until a safer target arrives.",
+              consecutive_plan_failures_);
+          flag_escape_emergency_ = true;
+          changeFSMExecState(EMERGENCY_STOP, "FSM");
+        }
+        else
+        {
+          changeFSMExecState(REPLAN_TRAJ, "FSM");
+        }
       }
 
       break;
@@ -618,8 +665,14 @@ namespace ego_planner
       }
       else
       {
-        if (enable_fail_safe_ && odom_vel_.norm() < 0.1)
+        const double retry_elapsed = (rclcpp::Clock().now() - last_plan_failure_time_).seconds();
+        if (
+            enable_fail_safe_ &&
+            odom_vel_.norm() < 0.1 &&
+            (consecutive_plan_failures_ < max_consecutive_plan_failures_ || retry_elapsed > plan_failure_retry_delay_))
+        {
           changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        }
       }
 
       flag_escape_emergency_ = false;
@@ -757,6 +810,7 @@ namespace ego_planner
 
         if (planFromCurrentTraj()) // Make a chance
         {
+          consecutive_plan_failures_ = 0;
           changeFSMExecState(EXEC_TRAJ, "SAFETY");
           publishSwarmTrajs(false);
           return;

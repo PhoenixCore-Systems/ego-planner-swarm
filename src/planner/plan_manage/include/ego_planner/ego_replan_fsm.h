@@ -68,6 +68,10 @@ namespace ego_planner
     bool have_trigger_, have_target_, have_odom_, have_new_target_, have_recv_pre_agent_;
     FSM_EXEC_STATE exec_state_;
     int continously_called_times_{0};
+    int consecutive_plan_failures_{0};
+    int max_consecutive_plan_failures_{8};
+    double plan_failure_retry_delay_{0.25};
+    rclcpp::Time last_plan_failure_time_{0, 0, RCL_SYSTEM_TIME};
 
     Eigen::Vector3d odom_pos_, odom_vel_, odom_acc_; // odometry state
     Eigen::Quaterniond odom_orient_;
