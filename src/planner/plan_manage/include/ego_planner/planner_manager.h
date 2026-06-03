@@ -41,6 +41,7 @@ namespace ego_planner
     void deliverTrajToOptimizer(void) { bspline_optimizer_->setSwarmTrajs(&swarm_trajs_buf_); };
 
     void setDroneIdtoOpt(void) { bspline_optimizer_->setDroneId(pp_.drone_id); }
+    void setTerrainProfile(const TerrainRefProfile &profile);
 
     double getSwarmClearance(void) { return bspline_optimizer_->getSwarmClearance(); }
 
@@ -53,6 +54,7 @@ namespace ego_planner
     GridMap::Ptr grid_map_;
     fast_planner::ObjPredictor::Ptr obj_predictor_;    
     SwarmTrajData swarm_trajs_buf_;
+    double terrain_max_profile_age_sec_{0.75};
 
   private:
     /* main planning algorithms & modules */

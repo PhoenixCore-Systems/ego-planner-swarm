@@ -20,6 +20,7 @@ namespace ego_planner
     node->declare_parameter("manager/planning_horizon", 5.0);
     node->declare_parameter("manager/use_distinctive_trajs", false);
     node->declare_parameter("manager/drone_id", -1);
+    node->declare_parameter("optimization/terrain_max_profile_age_sec", 0.75);
 
     node->get_parameter("manager/max_vel", pp_.max_vel_);
     node->get_parameter("manager/max_acc", pp_.max_acc_);
@@ -29,6 +30,7 @@ namespace ego_planner
     node->get_parameter("manager/planning_horizon", pp_.planning_horizen_);
     node->get_parameter("manager/use_distinctive_trajs", pp_.use_distinctive_trajs);
     node->get_parameter("manager/drone_id", pp_.drone_id);
+    node->get_parameter("optimization/terrain_max_profile_age_sec", terrain_max_profile_age_sec_);
 
     local_data_.traj_id_ = 0;
     grid_map_.reset(new GridMap);
@@ -45,6 +47,11 @@ namespace ego_planner
     visualization_ = vis;
   }
 
+  void EGOPlannerManager::setTerrainProfile(const TerrainRefProfile &profile)
+  {
+    bspline_optimizer_->setTerrainProfile(profile);
+  }
+
   bool EGOPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
                                         Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
@@ -59,6 +66,12 @@ namespace ego_planner
       return false;
     }
 
+    double local_target_z_ref;
+    if (bspline_optimizer_->getTerrainZRefForPoint(local_target_pt, local_target_z_ref))
+    {
+      local_target_pt.z() = local_target_z_ref;
+      local_target_vel.z() = 0.0;
+    }
     bspline_optimizer_->setLocalTargetPt(local_target_pt);
 
     rclcpp::Time t_start = rclcpp::Clock().now();
@@ -216,6 +229,15 @@ namespace ego_planner
       }
     } while (flag_regenerate);
 
+    for (size_t i = 1; i < point_set.size(); ++i)
+    {
+      double z_ref;
+      if (bspline_optimizer_->getTerrainZRefForPoint(point_set[i], z_ref))
+      {
+        point_set[i].z() = z_ref;
+      }
+    }
+
     // 将轨迹变为B样条轨迹
     Eigen::MatrixXd ctrl_pts, ctrl_pts_temp;
     UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
@@ -328,6 +350,16 @@ namespace ego_planner
 
     // t_refine = ros::Time::now() - t_start;
     t_refine = rclcpp::Clock().now() - t_start;
+
+    std::string terrain_validation_reason;
+    if (!bspline_optimizer_->validateTerrainTrajectory(pos, terrain_max_profile_age_sec_, &terrain_validation_reason))
+    {
+      RCLCPP_WARN(rclcpp::get_logger("ego_planner"),
+                  "Terrain validation rejected planned trajectory: %s",
+                  terrain_validation_reason.c_str());
+      continous_failures_count_++;
+      return false;
+    }
 
     // save planned results
     updateTrajInfo(pos, rclcpp::Clock().now());

@@ -26,6 +26,15 @@ def generate_launch_description():
     obstacles_inflation = LaunchConfiguration('obstacles_inflation', default=0.55)
     collision_dist0 = LaunchConfiguration('collision_dist0', default=1.0)
     swarm_clearance = LaunchConfiguration('swarm_clearance', default=1.0)
+    terrain_ref_enabled = LaunchConfiguration('terrain_ref_enabled', default=True)
+    terrain_ref_lambda = LaunchConfiguration('terrain_ref_lambda', default=4.0)
+    terrain_band_lambda = LaunchConfiguration('terrain_band_lambda', default=12.0)
+    terrain_min_confidence = LaunchConfiguration('terrain_min_confidence', default=0.20)
+    terrain_max_profile_age_sec = LaunchConfiguration('terrain_max_profile_age_sec', default=0.75)
+    terrain_max_lateral_m = LaunchConfiguration('terrain_max_lateral_m', default=1.5)
+    terrain_agl_tolerance_below = LaunchConfiguration('terrain_agl_tolerance_below', default=0.35)
+    terrain_agl_tolerance_above = LaunchConfiguration('terrain_agl_tolerance_above', default=0.60)
+    terrain_agl_floor_soft = LaunchConfiguration('terrain_agl_floor_soft', default=1.0)
     
     point_num = LaunchConfiguration('point_num', default=1)
     point0_x = LaunchConfiguration('point0_x', default=0.0)
@@ -80,6 +89,51 @@ def generate_launch_description():
         'swarm_clearance',
         default_value=swarm_clearance,
         description='EGO swarm clearance distance',
+    )
+    terrain_ref_enabled_arg = DeclareLaunchArgument(
+        'terrain_ref_enabled',
+        default_value=terrain_ref_enabled,
+        description='Enable terrain-reference Z optimization',
+    )
+    terrain_ref_lambda_arg = DeclareLaunchArgument(
+        'terrain_ref_lambda',
+        default_value=terrain_ref_lambda,
+        description='Terrain Z reference cost weight',
+    )
+    terrain_band_lambda_arg = DeclareLaunchArgument(
+        'terrain_band_lambda',
+        default_value=terrain_band_lambda,
+        description='Terrain AGL band cost weight',
+    )
+    terrain_min_confidence_arg = DeclareLaunchArgument(
+        'terrain_min_confidence',
+        default_value=terrain_min_confidence,
+        description='Minimum terrain profile confidence for optimizer samples',
+    )
+    terrain_max_profile_age_arg = DeclareLaunchArgument(
+        'terrain_max_profile_age_sec',
+        default_value=terrain_max_profile_age_sec,
+        description='Maximum terrain profile age before rejecting a plan',
+    )
+    terrain_max_lateral_arg = DeclareLaunchArgument(
+        'terrain_max_lateral_m',
+        default_value=terrain_max_lateral_m,
+        description='Maximum lateral distance from a terrain profile sample',
+    )
+    terrain_agl_below_arg = DeclareLaunchArgument(
+        'terrain_agl_tolerance_below',
+        default_value=terrain_agl_tolerance_below,
+        description='Allowed distance below desired terrain AGL',
+    )
+    terrain_agl_above_arg = DeclareLaunchArgument(
+        'terrain_agl_tolerance_above',
+        default_value=terrain_agl_tolerance_above,
+        description='Allowed distance above desired terrain AGL',
+    )
+    terrain_agl_floor_soft_arg = DeclareLaunchArgument(
+        'terrain_agl_floor_soft',
+        default_value=terrain_agl_floor_soft,
+        description='Absolute AGL hard-floor for terrain veto (recovery-aware)',
     )
     
     point_num_arg = DeclareLaunchArgument('point_num', default_value=point_num, description='Number of waypoints')
@@ -211,6 +265,15 @@ def generate_launch_description():
             {'optimization/swarm_clearance': swarm_clearance},
             {'optimization/max_vel': max_vel},
             {'optimization/max_acc': max_acc},
+            {'optimization/terrain_ref_enabled': terrain_ref_enabled},
+            {'optimization/terrain_ref_lambda': terrain_ref_lambda},
+            {'optimization/terrain_band_lambda': terrain_band_lambda},
+            {'optimization/terrain_min_confidence': terrain_min_confidence},
+            {'optimization/terrain_max_profile_age_sec': terrain_max_profile_age_sec},
+            {'optimization/terrain_max_lateral_m': terrain_max_lateral_m},
+            {'optimization/terrain_agl_tolerance_below': terrain_agl_tolerance_below},
+            {'optimization/terrain_agl_tolerance_above': terrain_agl_tolerance_above},
+            {'optimization/terrain_agl_floor_soft': terrain_agl_floor_soft},
 
             # B-Spline parameters
             {'bspline/limit_vel': max_vel},
@@ -245,7 +308,16 @@ def generate_launch_description():
     ld.add_action(obstacles_inflation_arg)
     ld.add_action(collision_dist0_arg)
     ld.add_action(swarm_clearance_arg)
-    
+    ld.add_action(terrain_ref_enabled_arg)
+    ld.add_action(terrain_ref_lambda_arg)
+    ld.add_action(terrain_band_lambda_arg)
+    ld.add_action(terrain_min_confidence_arg)
+    ld.add_action(terrain_max_profile_age_arg)
+    ld.add_action(terrain_max_lateral_arg)
+    ld.add_action(terrain_agl_below_arg)
+    ld.add_action(terrain_agl_above_arg)
+    ld.add_action(terrain_agl_floor_soft_arg)
+
     ld.add_action(point_num_arg)
     ld.add_action(point0_x_arg)
     ld.add_action(point0_y_arg)

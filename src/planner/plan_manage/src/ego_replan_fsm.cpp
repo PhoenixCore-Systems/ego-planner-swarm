@@ -1,5 +1,6 @@
 
 #include <ego_planner/ego_replan_fsm.h>
+#include <cmath>
 
 namespace ego_planner
 {
@@ -77,6 +78,16 @@ namespace ego_planner
           this->odometryCallback(msg);
         });
     // std::bind(&EGOReplanFSM::odometryCallback, this, std::placeholders::_1));
+
+    auto terrain_profile_qos = rclcpp::QoS(1);
+    terrain_profile_qos.reliable();
+    terrain_profile_sub_ = node_->create_subscription<p30_interfaces::msg::TerrainProfile>(
+        "/terrain/profile",
+        terrain_profile_qos,
+        [this](const std::shared_ptr<const p30_interfaces::msg::TerrainProfile> &msg)
+        {
+          this->terrainProfileCallback(msg);
+        });
 
     if (planner_manager_->pp_.drone_id >= 1)
     {
@@ -156,6 +167,40 @@ namespace ego_planner
     }
     else
       cout << "Wrong target_type_ value! target_type_=" << target_type_ << endl;
+  }
+
+  void EGOReplanFSM::terrainProfileCallback(
+      const std::shared_ptr<const p30_interfaces::msg::TerrainProfile> &msg)
+  {
+    TerrainRefProfile profile;
+    profile.stamp = rclcpp::Clock().now();
+    profile.desired_agl = msg->desired_agl;
+    profile.sample_spacing = msg->sample_spacing;
+    profile.corridor_width = msg->corridor_width;
+
+    const size_t n = std::min({
+        msg->z_ref_points.size(),
+        msg->ground_z.size(),
+        msg->confidence.size(),
+        msg->support_count.size()});
+    profile.samples.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+      const auto &pt = msg->z_ref_points[i];
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z) ||
+          !std::isfinite(msg->ground_z[i]) || !std::isfinite(msg->confidence[i]))
+      {
+        continue;
+      }
+      TerrainRefSample sample;
+      sample.z_ref_point = Eigen::Vector3d(pt.x, pt.y, pt.z);
+      sample.ground_z = msg->ground_z[i];
+      sample.confidence = msg->confidence[i];
+      sample.support_count = msg->support_count[i];
+      profile.samples.push_back(sample);
+    }
+    profile.valid = profile.desired_agl > 0.0 && !profile.samples.empty();
+    planner_manager_->setTerrainProfile(profile);
   }
 
   void EGOReplanFSM::readGivenWps()

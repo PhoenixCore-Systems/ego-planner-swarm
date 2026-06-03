@@ -2,6 +2,7 @@
 #define _BSPLINE_OPTIMIZER_H_
 
 #include <Eigen/Eigen>
+#include <cstdint>
 #include <path_searching/dyn_a_star.h>
 #include <bspline_opt/uniform_bspline.h>
 #include <plan_env/grid_map.h>
@@ -17,6 +18,24 @@
 // The format of points: N x 3 matrix, each row is a point
 namespace ego_planner
 {
+
+  struct TerrainRefSample
+  {
+    Eigen::Vector3d z_ref_point{Eigen::Vector3d::Zero()};
+    double ground_z{0.0};
+    double confidence{0.0};
+    std::uint32_t support_count{0};
+  };
+
+  struct TerrainRefProfile
+  {
+    rclcpp::Time stamp;
+    bool valid{false};
+    double desired_agl{0.0};
+    double sample_spacing{1.0};
+    double corridor_width{0.0};
+    std::vector<TerrainRefSample> samples;
+  };
 
   class ControlPoints
   {
@@ -103,6 +122,11 @@ namespace ego_planner
     void setBsplineInterval(const double &ts);
     void setSwarmTrajs(SwarmTrajData *swarm_trajs_ptr);
     void setDroneId(const int drone_id);
+    void setTerrainProfile(const TerrainRefProfile &profile);
+    bool getTerrainZRefForPoint(const Eigen::Vector3d &point, double &z_ref) const;
+    bool validateTerrainTrajectory(UniformBspline traj,
+                                   double max_profile_age_sec,
+                                   std::string *reason = nullptr) const;
 
     // optional inputs
     void setGuidePath(const vector<Eigen::Vector3d> &guide_pt);
@@ -159,18 +183,26 @@ namespace ego_planner
     double lambda2_, new_lambda2_; // distance weight
     double lambda3_;               // feasibility weight
     double lambda4_;               // curve fitting
+    double terrain_ref_lambda_;
+    double terrain_band_lambda_;
 
     int a;
     //
     double dist0_, swarm_clearance_; // safe distance
     double max_vel_, max_acc_;       // dynamic limits
-
+    bool terrain_ref_enabled_;
+    double terrain_min_confidence_;
+    double terrain_max_lateral_m_;
+    double terrain_agl_tolerance_below_;
+    double terrain_agl_tolerance_above_;
+    double terrain_agl_floor_soft_; // absolute AGL hard-floor for terrain veto
     int variable_num_;              // optimization variables
     int iter_num_;                  // iteration of the solver
     Eigen::VectorXd best_variable_; //
     double min_cost_;               //
 
-    Eigen::Vector3d local_target_pt_; 
+    Eigen::Vector3d local_target_pt_;
+    TerrainRefProfile terrain_profile_;
 
 #define INIT_min_ellip_dist_ 123456789.0123456789
     double min_ellip_dist_;
@@ -191,6 +223,15 @@ namespace ego_planner
     void calcMovingObjCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     void calcSwarmCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     void calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
+    void calcTerrainCost(const Eigen::MatrixXd &q,
+                         double &ref_cost,
+                         Eigen::MatrixXd &ref_gradient,
+                         double &band_cost,
+                         Eigen::MatrixXd &band_gradient);
+    bool nearestTerrainSample(const Eigen::Vector3d &point,
+                              double &z_ref,
+                              double &ground_z,
+                              double &confidence) const;
     bool check_collision_and_rebound(void);
 
     static int earlyExit(void *func_data, const double *x, const double *g, const double fx, const double xnorm, const double gnorm, const double step, int n, int k, int ls);

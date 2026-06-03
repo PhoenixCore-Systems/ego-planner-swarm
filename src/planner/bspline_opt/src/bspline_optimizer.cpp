@@ -1,5 +1,8 @@
 #include "bspline_opt/bspline_optimizer.h"
 #include "bspline_opt/gradient_descent_optimizer.h"
+#include <algorithm>
+#include <cmath>
+#include <limits>
 // using namespace std;
 
 namespace ego_planner
@@ -12,6 +15,14 @@ namespace ego_planner
     node->declare_parameter("optimization/lambda_collision", -1.0);
     node->declare_parameter("optimization/lambda_feasibility", -1.0);
     node->declare_parameter("optimization/lambda_fitness", -1.0);
+    node->declare_parameter("optimization/terrain_ref_enabled", true);
+    node->declare_parameter("optimization/terrain_ref_lambda", 1.0);
+    node->declare_parameter("optimization/terrain_band_lambda", 5.0);
+    node->declare_parameter("optimization/terrain_min_confidence", 0.20);
+    node->declare_parameter("optimization/terrain_max_lateral_m", 1.5);
+    node->declare_parameter("optimization/terrain_agl_tolerance_below", 0.35);
+    node->declare_parameter("optimization/terrain_agl_tolerance_above", 0.60);
+    node->declare_parameter("optimization/terrain_agl_floor_soft", 1.0);
 
     node->declare_parameter("optimization/dist0", -1.0);
     node->declare_parameter("optimization/swarm_clearance", -1.0);
@@ -24,6 +35,14 @@ namespace ego_planner
     node->get_parameter("optimization/lambda_collision", lambda2_);
     node->get_parameter("optimization/lambda_feasibility", lambda3_);
     node->get_parameter("optimization/lambda_fitness", lambda4_);
+    node->get_parameter("optimization/terrain_ref_enabled", terrain_ref_enabled_);
+    node->get_parameter("optimization/terrain_ref_lambda", terrain_ref_lambda_);
+    node->get_parameter("optimization/terrain_band_lambda", terrain_band_lambda_);
+    node->get_parameter("optimization/terrain_min_confidence", terrain_min_confidence_);
+    node->get_parameter("optimization/terrain_max_lateral_m", terrain_max_lateral_m_);
+    node->get_parameter("optimization/terrain_agl_tolerance_below", terrain_agl_tolerance_below_);
+    node->get_parameter("optimization/terrain_agl_tolerance_above", terrain_agl_tolerance_above_);
+    node->get_parameter("optimization/terrain_agl_floor_soft", terrain_agl_floor_soft_);
 
     node->get_parameter("optimization/dist0", dist0_);
     node->get_parameter("optimization/swarm_clearance", swarm_clearance_);
@@ -54,6 +73,107 @@ namespace ego_planner
   void BsplineOptimizer::setSwarmTrajs(SwarmTrajData *swarm_trajs_ptr) { swarm_trajs_ = swarm_trajs_ptr; }
 
   void BsplineOptimizer::setDroneId(const int drone_id) { drone_id_ = drone_id; }
+
+  void BsplineOptimizer::setTerrainProfile(const TerrainRefProfile &profile) { terrain_profile_ = profile; }
+
+  bool BsplineOptimizer::getTerrainZRefForPoint(const Eigen::Vector3d &point, double &z_ref) const
+  {
+    double ground_z, confidence;
+    return nearestTerrainSample(point, z_ref, ground_z, confidence);
+  }
+
+  bool BsplineOptimizer::validateTerrainTrajectory(
+      UniformBspline traj,
+      double max_profile_age_sec,
+      std::string *reason) const
+  {
+    // Terrain/AGL is a SOFT preference shaped by calcTerrainCost(); collision is
+    // enforced separately by the inflated-occupancy checks. The only HARD terrain
+    // veto here is the genuine "flying into the ground" case: a trajectory that
+    // drives the vehicle below an absolute AGL floor *and is not climbing out of
+    // it*. Above-band, transient band excursions, out-of-band starts, short
+    // profiles and sparse coverage are NOT vetoed - the terrain cost terms correct
+    // Z over the horizon, and the terrain follower + MUX low-AGL monitor remain the
+    // independent emergency net. (Previously this gate hard-rejected all of those
+    // cases, which deadlocked recovery: every plan starts at the current - possibly
+    // out-of-band - vehicle state, so the very trajectory needed to recover got
+    // vetoed for starting out of band.)
+    if (!terrain_ref_enabled_)
+    {
+      return true;
+    }
+    // No usable terrain knowledge => cannot enforce a terrain floor. Do not veto;
+    // rely on EGO occupancy avoidance and the MUX low-AGL emergency monitor.
+    if (!terrain_profile_.valid || terrain_profile_.samples.empty())
+    {
+      return true;
+    }
+    if (max_profile_age_sec > 0.0 && terrain_profile_.stamp.seconds() > 1e-6)
+    {
+      const double age = (rclcpp::Clock().now() - terrain_profile_.stamp).seconds();
+      if (age > max_profile_age_sec)
+      {
+        return true; // stale terrain => no veto, defer to emergency monitor
+      }
+    }
+
+    // Walk the executed portion of the trajectory and collect AGL where there is
+    // terrain coverage (a valid sample within terrain_max_lateral_m).
+    double t_min, t_max;
+    traj.getTimeSpan(t_min, t_max);
+    const double duration = std::max(0.0, t_max - t_min);
+    const double t_stop = t_min + duration * 2.0 / 3.0;
+    const double t_step = std::clamp(duration / 60.0, 0.03, 0.15);
+
+    bool have_cover = false;
+    double start_agl = 0.0;
+    double end_agl = 0.0;
+    double min_agl = 0.0;
+    for (double t = t_min; t <= t_stop + 1e-6; t += t_step)
+    {
+      const Eigen::Vector3d point = traj.evaluateDeBoorT(t);
+      double z_ref, ground_z, confidence;
+      if (!nearestTerrainSample(point, z_ref, ground_z, confidence))
+      {
+        continue;
+      }
+      const double agl = point.z() - ground_z;
+      if (!have_cover)
+      {
+        start_agl = agl;
+        min_agl = agl;
+        have_cover = true;
+      }
+      else
+      {
+        min_agl = std::min(min_agl, agl);
+      }
+      end_agl = agl;
+    }
+
+    // No covered samples => nothing to validate against; do not veto.
+    if (!have_cover)
+    {
+      return true;
+    }
+
+    // Recovery-aware hard floor: veto only if the trajectory dips below the
+    // absolute AGL floor AND is not climbing out of the low state. A plan that
+    // starts low but ends meaningfully higher is a legitimate recovery/climb.
+    constexpr double kClimbEps = 0.05;
+    if (min_agl < terrain_agl_floor_soft_ && end_agl <= start_agl + kClimbEps)
+    {
+      if (reason)
+      {
+        *reason = "terrain floor violation min_agl=" + std::to_string(min_agl) +
+                  " floor=" + std::to_string(terrain_agl_floor_soft_) +
+                  " start_agl=" + std::to_string(start_agl) +
+                  " end_agl=" + std::to_string(end_agl);
+      }
+      return false;
+    }
+    return true;
+  }
 
   // 返回多个安全的控制点集
   std::vector<ControlPoints> BsplineOptimizer::distinctiveTrajs(vector<std::pair<int, int>> segments)
@@ -871,6 +991,109 @@ namespace ego_planner
   }
 
   // 几个计算损失的函数
+  bool BsplineOptimizer::nearestTerrainSample(
+      const Eigen::Vector3d &point,
+      double &z_ref,
+      double &ground_z,
+      double &confidence) const
+  {
+    if (!terrain_ref_enabled_ || !terrain_profile_.valid || terrain_profile_.samples.empty())
+    {
+      return false;
+    }
+
+    const double max_lateral2 = terrain_max_lateral_m_ * terrain_max_lateral_m_;
+    double best_dist2 = std::numeric_limits<double>::infinity();
+    const TerrainRefSample *best = nullptr;
+
+    for (const auto &sample : terrain_profile_.samples)
+    {
+      if (sample.confidence < terrain_min_confidence_)
+      {
+        continue;
+      }
+      if (!std::isfinite(sample.z_ref_point.x()) ||
+          !std::isfinite(sample.z_ref_point.y()) ||
+          !std::isfinite(sample.z_ref_point.z()) ||
+          !std::isfinite(sample.ground_z))
+      {
+        continue;
+      }
+      if (grid_map_)
+      {
+        const Eigen::Vector3d ground_point(
+            sample.z_ref_point.x(), sample.z_ref_point.y(), sample.ground_z);
+        if ((grid_map_->isInMap(ground_point) && grid_map_->getInflateOccupancy(ground_point)) ||
+            (grid_map_->isInMap(sample.z_ref_point) && grid_map_->getInflateOccupancy(sample.z_ref_point)))
+        {
+          continue;
+        }
+      }
+      const double dx = point.x() - sample.z_ref_point.x();
+      const double dy = point.y() - sample.z_ref_point.y();
+      const double dist2 = dx * dx + dy * dy;
+      if (dist2 <= max_lateral2 && dist2 < best_dist2)
+      {
+        best_dist2 = dist2;
+        best = &sample;
+      }
+    }
+
+    if (best == nullptr)
+    {
+      return false;
+    }
+    z_ref = best->z_ref_point.z();
+    ground_z = best->ground_z;
+    confidence = std::clamp(best->confidence, 0.0, 1.0);
+    return true;
+  }
+
+  void BsplineOptimizer::calcTerrainCost(
+      const Eigen::MatrixXd &q,
+      double &ref_cost,
+      Eigen::MatrixXd &ref_gradient,
+      double &band_cost,
+      Eigen::MatrixXd &band_gradient)
+  {
+    ref_cost = 0.0;
+    band_cost = 0.0;
+    if (!terrain_ref_enabled_ || !terrain_profile_.valid || terrain_profile_.samples.empty())
+    {
+      return;
+    }
+
+    const int end_idx = q.cols() - order_;
+    for (int i = order_; i < end_idx; ++i)
+    {
+      double z_ref, ground_z, confidence;
+      if (!nearestTerrainSample(q.col(i), z_ref, ground_z, confidence))
+      {
+        continue;
+      }
+
+      const double z = q(2, i);
+      const double dz_ref = z - z_ref;
+      ref_cost += confidence * dz_ref * dz_ref;
+      ref_gradient(2, i) += 2.0 * confidence * dz_ref;
+
+      const double lower = ground_z + terrain_profile_.desired_agl - terrain_agl_tolerance_below_;
+      const double upper = ground_z + terrain_profile_.desired_agl + terrain_agl_tolerance_above_;
+      if (z < lower)
+      {
+        const double diff = lower - z;
+        band_cost += confidence * diff * diff;
+        band_gradient(2, i) += -2.0 * confidence * diff;
+      }
+      else if (z > upper)
+      {
+        const double diff = z - upper;
+        band_cost += confidence * diff * diff;
+        band_gradient(2, i) += 2.0 * confidence * diff;
+      }
+    }
+  }
+
   void BsplineOptimizer::calcSwarmCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient)
   {
     cost = 0.0;
@@ -1808,6 +2031,7 @@ namespace ego_planner
 
     /* ---------- evaluate cost and gradient ---------- */
     double f_smoothness, f_distance, f_feasibility /*, f_mov_objs*/, f_swarm, f_terminal;
+    double f_terrain_ref, f_terrain_band;
 
     Eigen::MatrixXd g_smoothness = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_distance = Eigen::MatrixXd::Zero(3, cps_.size);
@@ -1815,6 +2039,8 @@ namespace ego_planner
     // Eigen::MatrixXd g_mov_objs = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_swarm = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_terminal = Eigen::MatrixXd::Zero(3, cps_.size);
+    Eigen::MatrixXd g_terrain_ref = Eigen::MatrixXd::Zero(3, cps_.size);
+    Eigen::MatrixXd g_terrain_band = Eigen::MatrixXd::Zero(3, cps_.size);
 
     calcSmoothnessCost(cps_.points, f_smoothness, g_smoothness);
     calcDistanceCostRebound(cps_.points, f_distance, g_distance, iter_num_, f_smoothness);
@@ -1822,12 +2048,15 @@ namespace ego_planner
     // calcMovingObjCost(cps_.points, f_mov_objs, g_mov_objs);
     calcSwarmCost(cps_.points, f_swarm, g_swarm);
     calcTerminalCost(cps_.points, f_terminal, g_terminal);
+    calcTerrainCost(cps_.points, f_terrain_ref, g_terrain_ref, f_terrain_band, g_terrain_band);
 
-    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_swarm + lambda2_ * f_terminal;
+    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_swarm + lambda2_ * f_terminal +
+                terrain_ref_lambda_ * f_terrain_ref + terrain_band_lambda_ * f_terrain_band;
     // f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_mov_objs;
     // printf("origin %f %f %f %f\n", f_smoothness, f_distance, f_feasibility, f_combine);
 
-    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_swarm + lambda2_ * g_terminal;
+    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_swarm + lambda2_ * g_terminal +
+                              terrain_ref_lambda_ * g_terrain_ref + terrain_band_lambda_ * g_terrain_band;
     // Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_mov_objs;
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }
@@ -1840,22 +2069,28 @@ namespace ego_planner
 
     /* ---------- evaluate cost and gradient ---------- */
     double f_smoothness, f_fitness, f_feasibility;
+    double f_terrain_ref, f_terrain_band;
 
     Eigen::MatrixXd g_smoothness = Eigen::MatrixXd::Zero(3, cps_.points.cols());
     Eigen::MatrixXd g_fitness = Eigen::MatrixXd::Zero(3, cps_.points.cols());
     Eigen::MatrixXd g_feasibility = Eigen::MatrixXd::Zero(3, cps_.points.cols());
+    Eigen::MatrixXd g_terrain_ref = Eigen::MatrixXd::Zero(3, cps_.points.cols());
+    Eigen::MatrixXd g_terrain_band = Eigen::MatrixXd::Zero(3, cps_.points.cols());
 
     // time_satrt = rclcpp::Clock().now();
 
     calcSmoothnessCost(cps_.points, f_smoothness, g_smoothness);
     calcFitnessCost(cps_.points, f_fitness, g_fitness);
     calcFeasibilityCost(cps_.points, f_feasibility, g_feasibility);
+    calcTerrainCost(cps_.points, f_terrain_ref, g_terrain_ref, f_terrain_band, g_terrain_band);
 
     /* ---------- convert to solver format...---------- */
-    f_combine = lambda1_ * f_smoothness + lambda4_ * f_fitness + lambda3_ * f_feasibility;
+    f_combine = lambda1_ * f_smoothness + lambda4_ * f_fitness + lambda3_ * f_feasibility +
+                terrain_ref_lambda_ * f_terrain_ref + terrain_band_lambda_ * f_terrain_band;
     // printf("origin %f %f %f %f\n", f_smoothness, f_fitness, f_feasibility, f_combine);
 
-    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + lambda4_ * g_fitness + lambda3_ * g_feasibility;
+    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + lambda4_ * g_fitness + lambda3_ * g_feasibility +
+                              terrain_ref_lambda_ * g_terrain_ref + terrain_band_lambda_ * g_terrain_band;
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }
 
