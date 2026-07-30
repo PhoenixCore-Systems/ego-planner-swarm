@@ -4,12 +4,14 @@
 #include <Eigen/Eigen>
 #include <Eigen/StdVector>
 #include <cv_bridge/cv_bridge.h>
+#include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <iostream>
 #include <random>
 #include <nav_msgs/msg/odometry.hpp>
 #include <queue>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tuple>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -23,6 +25,7 @@
 #include <message_filters/time_synchronizer.h>
 
 #include <plan_env/raycast.h>
+#include <plan_env/observed_space.h>
 
 #define logit(x) (log((x) / (1 - (x))))
 
@@ -87,6 +90,23 @@ struct MappingParameters
 
   /* active mapping */
   double unknown_flag_;
+
+  /* opt-in observed-space safety gate */
+  bool observed_space_enabled_;
+  double observed_space_timeout_;
+  double observed_space_retention_;
+  double observed_space_clearance_;
+  int observed_space_ray_dilation_voxels_;
+  double observed_space_seed_radius_;
+  double observed_space_min_update_interval_;
+  // Voxel size of the visibility mask, independent of the obstacle map. LiDAR
+  // beams fan out with range: a Mid360 frame averages roughly 1.6 deg between
+  // neighbouring beams, so at 5 m they are about 0.14 m apart. Storing the mask
+  // at the 0.1 m obstacle resolution therefore leaves unmarked gaps between
+  // beams, and observed space degenerates from a volume into a bundle of thin
+  // threads that almost no trajectory can stay inside. This must be at least
+  // the beam separation at the planning horizon.
+  double observed_space_resolution_;
 };
 
 // intermediate mapping data for fusion
@@ -172,7 +192,7 @@ public:
   inline void setOccupied(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3d pos);
   inline int getOccupancy(Eigen::Vector3i id);
-  inline int getInflateOccupancy(Eigen::Vector3d pos);
+  int getInflateOccupancy(const Eigen::Vector3d &pos);
 
   inline void boundIndex(Eigen::Vector3i &id);
   inline bool isUnknown(const Eigen::Vector3i &id);
@@ -194,8 +214,34 @@ public:
   Eigen::Vector3d getOrigin();
   int getVoxelNum();
   bool getOdomDepthTimeout() { return md_.flag_depth_odom_timeout_; }
+  bool observedSpaceGateEnabled() const { return mp_.observed_space_enabled_; }
+  bool observedSpaceFresh();
+  double observedSpaceAge() const;
+  bool isObservedSpaceCovered(const Eigen::Vector3d &pos);
+  bool clampToObservedSpace(
+      const Eigen::Vector3d &start,
+      const Eigen::Vector3d &desired,
+      double frontier_margin,
+      Eigen::Vector3d &target,
+      bool &clamped);
 
   typedef std::shared_ptr<GridMap> Ptr;
+
+  /**
+   * Abort if this translation unit was compiled against a different grid_map.h
+   * than the one libplan_env.so was built from.
+   *
+   * GridMap stores MappingParameters and MappingData by value, and the accessors
+   * below (getOccupancy, isUnknown, toAddress, ...) are inlined into every
+   * consumer package. Adding a field to either struct shifts md_ for callers
+   * that were not recompiled, so a stale bspline_opt or path_searching silently
+   * dereferences an occupancy buffer read from the wrong offset. Rebuilding
+   * plan_env alone is not enough; every package that includes this header must
+   * be rebuilt with it.
+   */
+  static void assertAbiMatchesLinkedLibrary(
+      std::size_t consumer_sizeof_grid_map,
+      const char *consumer_name);
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
@@ -209,6 +255,9 @@ private:
   void extrinsicCallback(const nav_msgs::msg::Odometry::ConstPtr &odom);
   void depthOdomCallback(const sensor_msgs::msg::Image::ConstPtr &img, const nav_msgs::msg::Odometry::ConstPtr &odom);
   void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img);
+  void visibilityCallback(
+      const sensor_msgs::msg::PointCloud2::ConstPtr &cloud,
+      const geometry_msgs::msg::PointStamped::ConstPtr &origin);
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom);
 
   // update occupancy by raycasting
@@ -234,6 +283,12 @@ private:
       SyncPolicyImagePose;
   typedef shared_ptr<message_filters::Synchronizer<SyncPolicyImagePose>> SynchronizerImagePose;
   typedef shared_ptr<message_filters::Synchronizer<SyncPolicyImageOdom>> SynchronizerImageOdom;
+  typedef message_filters::sync_policies::ExactTime<
+      sensor_msgs::msg::PointCloud2,
+      geometry_msgs::msg::PointStamped>
+      SyncPolicyVisibility;
+  typedef shared_ptr<message_filters::Synchronizer<SyncPolicyVisibility>>
+      SynchronizerVisibility;
 
   rclcpp::Node::SharedPtr node_;
   std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> depth_sub_;
@@ -241,6 +296,11 @@ private:
   std::shared_ptr<message_filters::Subscriber<nav_msgs::msg::Odometry>> odom_sub_;
   SynchronizerImagePose sync_image_pose_;
   SynchronizerImageOdom sync_image_odom_;
+  std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>
+      visibility_cloud_sub_;
+  std::shared_ptr<message_filters::Subscriber<geometry_msgs::msg::PointStamped>>
+      visibility_origin_sub_;
+  SynchronizerVisibility sync_visibility_;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr indep_cloud_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr indep_odom_sub_;
@@ -251,6 +311,13 @@ private:
 
   rclcpp::TimerBase::SharedPtr occ_timer_;
   rclcpp::TimerBase::SharedPtr vis_timer_;
+
+  ObservedSpaceGrid observed_space_;
+  // Freshness decided at planning-cycle boundaries by observedSpaceFresh() and
+  // consumed by every per-point coverage query. See isObservedSpaceCovered().
+  bool observed_space_fresh_snapshot_{false};
+  double last_observed_space_integration_sec_{0.0};
+  bool has_integrated_observed_space_{false};
 
   //
   uniform_real_distribution<double> rand_noise_;
@@ -354,17 +421,6 @@ inline int GridMap::getOccupancy(Eigen::Vector3d pos)
   return md_.occupancy_buffer_[toAddress(id)] > mp_.min_occupancy_log_ ? 1 : 0;
 }
 
-inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos)
-{
-  if (!isInMap(pos))
-    return -1;
-
-  Eigen::Vector3i id;
-  posToIndex(pos, id);
-
-  return int(md_.occupancy_buffer_inflate_[toAddress(id)]);
-}
-
 inline int GridMap::getOccupancy(Eigen::Vector3i id)
 {
   if (id(0) < 0 || id(0) >= mp_.map_voxel_num_(0) || id(1) < 0 || id(1) >= mp_.map_voxel_num_(1) ||
@@ -447,5 +503,11 @@ inline void GridMap::inflatePoint(const Eigen::Vector3i &pt, int step, vector<Ei
 }
 
 inline double GridMap::getResolution() { return mp_.resolution_; }
+
+// Call once from any package that inlines GridMap accessors, before the map is
+// used. sizeof(GridMap) is evaluated in the caller's translation unit and
+// compared against the value compiled into libplan_env.so.
+#define PLAN_ENV_ASSERT_GRID_MAP_ABI() \
+  GridMap::assertAbiMatchesLinkedLibrary(sizeof(GridMap), __FILE__)
 
 #endif

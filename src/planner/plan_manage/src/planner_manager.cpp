@@ -1,5 +1,8 @@
 // #include <fstream>
 #include <ego_planner/planner_manager.h>
+#include <cmath>
+#include <sstream>
+#include <stdexcept>
 #include <thread>
 #include "visualization_msgs/msg/marker.hpp" // zx-todo
 
@@ -20,6 +23,7 @@ namespace ego_planner
     node->declare_parameter("manager/planning_horizon", 5.0);
     node->declare_parameter("manager/use_distinctive_trajs", false);
     node->declare_parameter("manager/drone_id", -1);
+    node->declare_parameter("manager/observed_space_validation_step", 0.05);
     node->declare_parameter("optimization/terrain_max_profile_age_sec", 0.75);
 
     node->get_parameter("manager/max_vel", pp_.max_vel_);
@@ -30,9 +34,20 @@ namespace ego_planner
     node->get_parameter("manager/planning_horizon", pp_.planning_horizen_);
     node->get_parameter("manager/use_distinctive_trajs", pp_.use_distinctive_trajs);
     node->get_parameter("manager/drone_id", pp_.drone_id);
+    node->get_parameter(
+        "manager/observed_space_validation_step",
+        observed_space_validation_step_);
     node->get_parameter("optimization/terrain_max_profile_age_sec", terrain_max_profile_age_sec_);
 
+    if (!std::isfinite(observed_space_validation_step_) ||
+        observed_space_validation_step_ <= 0.0)
+    {
+      throw std::invalid_argument(
+          "manager/observed_space_validation_step must be positive.");
+    }
+
     local_data_.traj_id_ = 0;
+    PLAN_ENV_ASSERT_GRID_MAP_ABI();
     grid_map_.reset(new GridMap);
     // grid_map_->initMap(nh);
     grid_map_->initMap(node);
@@ -361,6 +376,17 @@ namespace ego_planner
       return false;
     }
 
+    std::string observed_validation_reason;
+    if (!validateFullObservedTrajectory(pos, &observed_validation_reason))
+    {
+      RCLCPP_WARN(
+          rclcpp::get_logger("ego_planner"),
+          "Full trajectory safety validation rejected planned trajectory: %s",
+          observed_validation_reason.c_str());
+      continous_failures_count_++;
+      return false;
+    }
+
     // save planned results
     updateTrajInfo(pos, rclcpp::Clock().now());
 
@@ -376,6 +402,61 @@ namespace ego_planner
 
     // success. YoY
     continous_failures_count_ = 0;
+    return true;
+  }
+
+  bool EGOPlannerManager::validateFullObservedTrajectory(
+      UniformBspline &traj,
+      std::string *reason)
+  {
+    if (!grid_map_->observedSpaceGateEnabled())
+      return true;
+
+    if (!grid_map_->observedSpaceFresh())
+    {
+      if (reason)
+        *reason = "visibility stream is stale or unavailable";
+      return false;
+    }
+
+    double t_min = 0.0;
+    double t_max = 0.0;
+    if (!traj.getTimeSpan(t_min, t_max))
+    {
+      if (reason)
+        *reason = "invalid B-spline time span";
+      return false;
+    }
+
+    const double duration = std::max(0.0, t_max - t_min);
+    const double sample_dt = std::max(
+        1e-3,
+        observed_space_validation_step_ /
+            std::max(1e-3, pp_.max_vel_));
+    const int sample_count = std::max(
+        1, static_cast<int>(std::ceil(duration / sample_dt)));
+
+    for (int sample = 0; sample <= sample_count; ++sample)
+    {
+      const double t = duration *
+          static_cast<double>(sample) /
+          static_cast<double>(sample_count);
+      const Eigen::Vector3d point = traj.evaluateDeBoorT(t);
+      const bool observed = grid_map_->isObservedSpaceCovered(point);
+      const bool occupied = grid_map_->getInflateOccupancy(point) != 0;
+      if (!observed || occupied)
+      {
+        if (reason)
+        {
+          std::ostringstream message;
+          message << (observed ? "inflated obstacle" : "unknown, outside-map, or stale visibility")
+                  << " at t=" << t << "s position=["
+                  << point.x() << ", " << point.y() << ", " << point.z() << "]";
+          *reason = message.str();
+        }
+        return false;
+      }
+    }
     return true;
   }
 

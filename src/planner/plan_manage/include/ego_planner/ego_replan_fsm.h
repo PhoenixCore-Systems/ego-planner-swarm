@@ -9,6 +9,7 @@
 #include "sensor_msgs/msg/imu.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/empty.hpp"
+#include "std_srvs/srv/trigger.hpp"
 #include <vector>
 #include "visualization_msgs/msg/marker.hpp"
 
@@ -64,6 +65,19 @@ namespace ego_planner
     double emergency_time_;
     bool flag_realworld_experiment_;
     bool enable_fail_safe_;
+    bool tracking_error_monitor_enabled_;
+    double tracking_error_soft_threshold_;
+    double tracking_error_hard_threshold_;
+    double tracking_error_soft_duration_;
+    double tracking_error_hard_duration_;
+    double goal_tolerance_;
+    double goal_velocity_tolerance_;
+    double observed_space_target_margin_;
+    double observed_space_target_search_half_angle_deg_;
+    int observed_space_target_search_steps_;
+    double stall_commanded_speed_;
+    double stall_measured_speed_;
+    double stall_duration_;
 
     /* planning data */
     bool have_trigger_, have_target_, have_odom_, have_new_target_, have_recv_pre_agent_;
@@ -83,7 +97,19 @@ namespace ego_planner
     std::vector<Eigen::Vector3d> wps_;
     int current_wp_;
 
-    bool flag_escape_emergency_;
+    bool flag_escape_emergency_{false};
+    bool replan_from_measured_state_{false};
+    bool tracking_error_emergency_latched_{false};
+    bool soft_tracking_error_active_{false};
+    bool hard_tracking_error_active_{false};
+    rclcpp::Time soft_tracking_error_since_{0, 0, RCL_SYSTEM_TIME};
+    rclcpp::Time hard_tracking_error_since_{0, 0, RCL_SYSTEM_TIME};
+    // Stall detection deliberately survives FSM state changes and soft replans.
+    // The soft threshold resets tracking error by replanning from measured
+    // odometry, so a vehicle that is commanded to move but never moves would
+    // otherwise soft-trip forever and never reach the hard threshold.
+    bool stall_active_{false};
+    rclcpp::Time stall_since_{0, 0, RCL_SYSTEM_TIME};
 
     /* ROS utils */
     rclcpp::Node::SharedPtr node_;
@@ -102,12 +128,16 @@ namespace ego_planner
     rclcpp::Publisher<traj_utils::msg::DataDisp>::SharedPtr data_disp_pub_;
     rclcpp::Publisher<traj_utils::msg::MultiBsplines>::SharedPtr swarm_trajs_pub_;
     rclcpp::Publisher<traj_utils::msg::Bspline>::SharedPtr broadcast_bspline_pub_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr cancel_service_;
 
     /* helper functions */
     bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj); // front-end and back-end method
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromGlobalTraj(const int trial_times = 1);
     bool planFromCurrentTraj(const int trial_times = 1);
+    bool planFromMeasuredState(const int trial_times = 1);
+    void resetTrackingErrorDebounce();
+    void resetStallDebounce();
 
     /* return value: std::pair< Times of the same state be continuously called, current continuously called state > */
     void changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call);
@@ -124,6 +154,9 @@ namespace ego_planner
     void waypointCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg);
     void triggerCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg);
     void odometryCallback(const std::shared_ptr<const nav_msgs::msg::Odometry> &msg);
+    void cancelPlanningCallback(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response);
     void swarmTrajsCallback(const std::shared_ptr<const traj_utils::msg::MultiBsplines> &msg);
     void BroadcastBsplineCallback(const std::shared_ptr<const traj_utils::msg::Bspline> &msg);
     void terrainProfileCallback(const std::shared_ptr<const p30_interfaces::msg::TerrainProfile> &msg);

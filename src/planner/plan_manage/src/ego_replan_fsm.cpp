@@ -1,6 +1,7 @@
 
 #include <ego_planner/ego_replan_fsm.h>
 #include <cmath>
+#include <stdexcept>
 
 namespace ego_planner
 {
@@ -14,6 +15,11 @@ namespace ego_planner
     have_target_ = false;
     have_odom_ = false;
     have_recv_pre_agent_ = false;
+    flag_escape_emergency_ = false;
+    replan_from_measured_state_ = false;
+    tracking_error_emergency_latched_ = false;
+    resetTrackingErrorDebounce();
+    resetStallDebounce();
 
     node_->declare_parameter("fsm/flight_type", -1);
     node_->declare_parameter("fsm/thresh_replan_time", -1.0);
@@ -25,6 +31,20 @@ namespace ego_planner
     node_->declare_parameter("fsm/fail_safe", true);
     node_->declare_parameter("fsm/max_consecutive_plan_failures", 8);
     node_->declare_parameter("fsm/plan_failure_retry_delay", 0.25);
+    node_->declare_parameter("fsm/tracking_error_monitor_enabled", true);
+    node_->declare_parameter("fsm/tracking_error_soft_threshold", 0.5);
+    node_->declare_parameter("fsm/tracking_error_hard_threshold", 1.0);
+    node_->declare_parameter("fsm/tracking_error_soft_duration", 0.25);
+    node_->declare_parameter("fsm/tracking_error_hard_duration", 0.10);
+    node_->declare_parameter("fsm/goal_tolerance", 0.3);
+    node_->declare_parameter("fsm/goal_velocity_tolerance", 0.2);
+    node_->declare_parameter("fsm/observed_space_target_margin", 0.0);
+    node_->declare_parameter(
+        "fsm/observed_space_target_search_half_angle_deg", 60.0);
+    node_->declare_parameter("fsm/observed_space_target_search_steps", 3);
+    node_->declare_parameter("fsm/stall_commanded_speed", 0.15);
+    node_->declare_parameter("fsm/stall_measured_speed", 0.05);
+    node_->declare_parameter("fsm/stall_duration", 2.0);
 
     node_->get_parameter("fsm/flight_type", target_type_);
     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
@@ -36,6 +56,91 @@ namespace ego_planner
     node_->get_parameter("fsm/fail_safe", enable_fail_safe_);
     node_->get_parameter("fsm/max_consecutive_plan_failures", max_consecutive_plan_failures_);
     node_->get_parameter("fsm/plan_failure_retry_delay", plan_failure_retry_delay_);
+    node_->get_parameter("fsm/tracking_error_monitor_enabled", tracking_error_monitor_enabled_);
+    node_->get_parameter("fsm/tracking_error_soft_threshold", tracking_error_soft_threshold_);
+    node_->get_parameter("fsm/tracking_error_hard_threshold", tracking_error_hard_threshold_);
+    node_->get_parameter("fsm/tracking_error_soft_duration", tracking_error_soft_duration_);
+    node_->get_parameter("fsm/tracking_error_hard_duration", tracking_error_hard_duration_);
+    node_->get_parameter("fsm/goal_tolerance", goal_tolerance_);
+    node_->get_parameter("fsm/goal_velocity_tolerance", goal_velocity_tolerance_);
+    node_->get_parameter(
+        "fsm/observed_space_target_margin",
+        observed_space_target_margin_);
+    node_->get_parameter(
+        "fsm/observed_space_target_search_half_angle_deg",
+        observed_space_target_search_half_angle_deg_);
+    node_->get_parameter(
+        "fsm/observed_space_target_search_steps",
+        observed_space_target_search_steps_);
+    node_->get_parameter("fsm/stall_commanded_speed", stall_commanded_speed_);
+    node_->get_parameter("fsm/stall_measured_speed", stall_measured_speed_);
+    node_->get_parameter("fsm/stall_duration", stall_duration_);
+
+    if (tracking_error_monitor_enabled_ &&
+        (!std::isfinite(stall_commanded_speed_) ||
+         stall_commanded_speed_ <= 0.0 ||
+         !std::isfinite(stall_measured_speed_) ||
+         stall_measured_speed_ < 0.0 ||
+         stall_measured_speed_ >= stall_commanded_speed_ ||
+         !std::isfinite(stall_duration_) ||
+         stall_duration_ <= 0.0))
+    {
+      throw std::invalid_argument(
+          "Stall detection requires 0 <= measured < commanded speed thresholds and a positive duration.");
+    }
+
+    if (tracking_error_monitor_enabled_ &&
+        (!std::isfinite(tracking_error_soft_threshold_) ||
+         !std::isfinite(tracking_error_hard_threshold_) ||
+         tracking_error_soft_threshold_ <= 0.0 ||
+         tracking_error_hard_threshold_ <= tracking_error_soft_threshold_ ||
+         !std::isfinite(tracking_error_soft_duration_) ||
+         !std::isfinite(tracking_error_hard_duration_) ||
+         tracking_error_soft_duration_ < 0.0 ||
+         tracking_error_hard_duration_ < 0.0))
+    {
+      throw std::invalid_argument(
+          "Tracking-error thresholds must satisfy 0 < soft < hard and debounce durations must be non-negative.");
+    }
+    if (!std::isfinite(goal_tolerance_) || goal_tolerance_ <= 0.0 ||
+        !std::isfinite(goal_velocity_tolerance_) || goal_velocity_tolerance_ < 0.0)
+    {
+      throw std::invalid_argument(
+          "Goal tolerance must be positive and goal velocity tolerance must be non-negative.");
+    }
+    if (!std::isfinite(observed_space_target_margin_) ||
+        observed_space_target_margin_ < 0.0)
+    {
+      throw std::invalid_argument(
+          "fsm/observed_space_target_margin must be non-negative.");
+    }
+    if (!std::isfinite(observed_space_target_search_half_angle_deg_) ||
+        observed_space_target_search_half_angle_deg_ < 0.0 ||
+        observed_space_target_search_half_angle_deg_ > 90.0 ||
+        observed_space_target_search_steps_ < 0)
+    {
+      throw std::invalid_argument(
+          "fsm/observed_space_target_search_half_angle_deg must be in [0, 90] and "
+          "fsm/observed_space_target_search_steps must be non-negative. Zero for "
+          "either restricts the target search to the straight reference ray.");
+    }
+
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "Tracking safety monitor: enabled=%s soft=%.2fm/%.2fs hard=%.2fm/%.2fs "
+        "goal=%.2fm/%.2fmps stall=%.2f/%.2fmps for %.2fs target_search=+-%.0fdeg/%dsteps",
+        tracking_error_monitor_enabled_ ? "true" : "false",
+        tracking_error_soft_threshold_,
+        tracking_error_soft_duration_,
+        tracking_error_hard_threshold_,
+        tracking_error_hard_duration_,
+        goal_tolerance_,
+        goal_velocity_tolerance_,
+        stall_commanded_speed_,
+        stall_measured_speed_,
+        stall_duration_,
+        observed_space_target_search_half_angle_deg_,
+        observed_space_target_search_steps_);
 
     have_trigger_ = !flag_realworld_experiment_;
 
@@ -78,6 +183,15 @@ namespace ego_planner
           this->odometryCallback(msg);
         });
     // std::bind(&EGOReplanFSM::odometryCallback, this, std::placeholders::_1));
+
+    cancel_service_ = node_->create_service<std_srvs::srv::Trigger>(
+        "planning/cancel",
+        [this](
+            const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+            std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+        {
+          this->cancelPlanningCallback(request, response);
+        });
 
     auto terrain_profile_qos = rclcpp::QoS(1);
     terrain_profile_qos.reliable();
@@ -239,6 +353,17 @@ namespace ego_planner
 
     if (success)
     {
+      if (tracking_error_emergency_latched_)
+      {
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "A new goal was accepted; clearing the tracking-error emergency-stop latch.");
+        tracking_error_emergency_latched_ = false;
+      }
+      replan_from_measured_state_ = false;
+      resetTrackingErrorDebounce();
+      resetStallDebounce();
+
       end_pt_ = next_wp;
 
       constexpr double step_size_t = 0.1;
@@ -267,7 +392,6 @@ namespace ego_planner
             node_->get_logger(),
             "Received a waypoint while the planner is busy; replacing the active target and restarting from the new global trajectory.");
         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
-        flag_escape_emergency_ = true;
       }
 
       visualization_->displayGlobalPathList(gloabl_traj, 0.1, 0);
@@ -320,6 +444,48 @@ namespace ego_planner
     odom_orient_.z() = msg->pose.pose.orientation.z;
 
     have_odom_ = true;
+  }
+
+  void EGOReplanFSM::cancelPlanningCallback(
+      const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+  {
+    (void)request;
+
+    have_target_ = false;
+    have_new_target_ = false;
+    replan_from_measured_state_ = false;
+    tracking_error_emergency_latched_ = false;
+    consecutive_plan_failures_ = 0;
+    flag_escape_emergency_ = false;
+    resetTrackingErrorDebounce();
+    resetStallDebounce();
+
+    if (!have_odom_)
+    {
+      changeFSMExecState(WAIT_TARGET, "CANCEL");
+      response->success = false;
+      response->message =
+          "Planner target cleared, but no odometry was available for a stop spline.";
+      RCLCPP_ERROR(node_->get_logger(), "%s", response->message.c_str());
+      return;
+    }
+
+    const bool stop_published = callEmergencyStop(odom_pos_);
+    changeFSMExecState(WAIT_TARGET, "CANCEL");
+
+    response->success = stop_published;
+    response->message = stop_published
+                            ? "Planner target cleared and current-odometry stop spline published."
+                            : "Planner target cleared, but stop spline publication failed.";
+    if (stop_published)
+    {
+      RCLCPP_INFO(node_->get_logger(), "%s", response->message.c_str());
+    }
+    else
+    {
+      RCLCPP_ERROR(node_->get_logger(), "%s", response->message.c_str());
+    }
   }
 
   void EGOReplanFSM::BroadcastBsplineCallback(const std::shared_ptr<const traj_utils::msg::Bspline> &msg)
@@ -493,16 +659,50 @@ namespace ego_planner
 
   void EGOReplanFSM::changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call)
   {
+    if (tracking_error_emergency_latched_ &&
+        exec_state_ == EMERGENCY_STOP &&
+        new_state != EMERGENCY_STOP)
+    {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(),
+          *node_->get_clock(),
+          2000,
+          "Tracking-error emergency stop remains latched; a new accepted goal is required before leaving HOLD.");
+      return;
+    }
+
+    if (new_state == EMERGENCY_STOP && exec_state_ != EMERGENCY_STOP)
+    {
+      // Every entry into EMERGENCY_STOP must publish exactly one stop spline.
+      flag_escape_emergency_ = true;
+    }
 
     if (new_state == exec_state_)
       continously_called_times_++;
     else
+    {
       continously_called_times_ = 1;
+      resetTrackingErrorDebounce();
+    }
 
     static string state_str[8] = {"INIT", "WAIT_TARGET", "GEN_NEW_TRAJ", "REPLAN_TRAJ", "EXEC_TRAJ", "EMERGENCY_STOP", "SEQUENTIAL_START"};
     int pre_s = int(exec_state_);
     exec_state_ = new_state;
     cout << "[" + pos_call + "]: from " + state_str[pre_s] + " to " + state_str[int(new_state)] << endl;
+  }
+
+  void EGOReplanFSM::resetTrackingErrorDebounce()
+  {
+    soft_tracking_error_active_ = false;
+    hard_tracking_error_active_ = false;
+    soft_tracking_error_since_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+    hard_tracking_error_since_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+  }
+
+  void EGOReplanFSM::resetStallDebounce()
+  {
+    stall_active_ = false;
+    stall_since_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
   }
 
   std::pair<int, EGOReplanFSM::FSM_EXEC_STATE> EGOReplanFSM::timesOfConsecutiveStateCalls()
@@ -592,7 +792,6 @@ namespace ego_planner
       {
         consecutive_plan_failures_ = 0;
         changeFSMExecState(EXEC_TRAJ, "FSM");
-        flag_escape_emergency_ = true;
         publishSwarmTrajs(false);
       }
       else
@@ -605,7 +804,6 @@ namespace ego_planner
               node_->get_logger(),
               "Planner failed %d consecutive new-trajectory attempts; entering emergency stop until a safer target arrives.",
               consecutive_plan_failures_);
-          flag_escape_emergency_ = true;
           changeFSMExecState(EMERGENCY_STOP, "FSM");
         }
         else
@@ -626,9 +824,14 @@ namespace ego_planner
         break;
       }
 
-      if (planFromCurrentTraj(1))
+      const bool planned_from_measured_state = replan_from_measured_state_;
+      const bool replan_success = planned_from_measured_state
+                                      ? planFromMeasuredState(1)
+                                      : planFromCurrentTraj(1);
+      if (replan_success)
       {
         consecutive_plan_failures_ = 0;
+        replan_from_measured_state_ = false;
         changeFSMExecState(EXEC_TRAJ, "FSM");
         publishSwarmTrajs(false);
       }
@@ -642,7 +845,6 @@ namespace ego_planner
               node_->get_logger(),
               "Planner failed %d consecutive replans; entering emergency stop until a safer target arrives.",
               consecutive_plan_failures_);
-          flag_escape_emergency_ = true;
           changeFSMExecState(EMERGENCY_STOP, "FSM");
         }
         else
@@ -660,14 +862,119 @@ namespace ego_planner
       LocalTrajData *info = &planner_manager_->local_data_;
       rclcpp::Time time_now = rclcpp::Clock().now();
       double t_cur = (time_now - info->start_time_).seconds();
-      t_cur = std::min(info->duration_, t_cur);
+      t_cur = std::clamp(t_cur, 0.0, info->duration_);
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
+      const double tracking_error = (odom_pos_ - pos).norm();
+
+      if (tracking_error_monitor_enabled_)
+      {
+        const rclcpp::Time debounce_now = node_->now();
+
+        // Stall check first. A vehicle that is commanded to move but does not
+        // move is the props-off / wedged case, and the soft threshold below
+        // hides it: soft trips at roughly 0.7 m of error and then replans from
+        // measured odometry, which resets the error before the hard threshold
+        // is ever reached. This timer is therefore kept out of
+        // resetTrackingErrorDebounce() and cleared only by real motion, a new
+        // accepted goal, or a cancel.
+        const double commanded_speed =
+            info->velocity_traj_.evaluateDeBoorT(t_cur).norm();
+        const double measured_speed_now = odom_vel_.norm();
+        if (commanded_speed >= stall_commanded_speed_ &&
+            measured_speed_now <= stall_measured_speed_)
+        {
+          if (!stall_active_)
+          {
+            stall_active_ = true;
+            stall_since_ = debounce_now;
+          }
+
+          const double stalled_for = (debounce_now - stall_since_).seconds();
+          if (stalled_for >= stall_duration_)
+          {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Commanded %.3fm/s but measured %.3fm/s for %.3fs; the vehicle is not "
+                "following the trajectory. Publishing an odometry-position emergency stop "
+                "and latching HOLD until a new goal.",
+                commanded_speed,
+                measured_speed_now,
+                stalled_for);
+            tracking_error_emergency_latched_ = true;
+            replan_from_measured_state_ = false;
+            resetStallDebounce();
+            changeFSMExecState(EMERGENCY_STOP, "STALL");
+            break;
+          }
+        }
+        else
+        {
+          stall_active_ = false;
+        }
+
+        if (tracking_error >= tracking_error_hard_threshold_)
+        {
+          if (!hard_tracking_error_active_)
+          {
+            hard_tracking_error_active_ = true;
+            hard_tracking_error_since_ = debounce_now;
+          }
+
+          if ((debounce_now - hard_tracking_error_since_).seconds() >=
+              tracking_error_hard_duration_)
+          {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Tracking error %.3fm exceeded the hard %.3fm threshold for %.3fs; "
+                "publishing an odometry-position emergency stop and latching HOLD until a new goal.",
+                tracking_error,
+                tracking_error_hard_threshold_,
+                (debounce_now - hard_tracking_error_since_).seconds());
+            tracking_error_emergency_latched_ = true;
+            replan_from_measured_state_ = false;
+            changeFSMExecState(EMERGENCY_STOP, "TRACKING_HARD");
+            break;
+          }
+        }
+        else
+        {
+          hard_tracking_error_active_ = false;
+        }
+
+        if (tracking_error >= tracking_error_soft_threshold_)
+        {
+          if (!soft_tracking_error_active_)
+          {
+            soft_tracking_error_active_ = true;
+            soft_tracking_error_since_ = debounce_now;
+          }
+
+          if ((debounce_now - soft_tracking_error_since_).seconds() >=
+              tracking_error_soft_duration_)
+          {
+            RCLCPP_WARN(
+                node_->get_logger(),
+                "Tracking error %.3fm exceeded the soft %.3fm threshold for %.3fs; "
+                "requesting a replan from measured odometry.",
+                tracking_error,
+                tracking_error_soft_threshold_,
+                (debounce_now - soft_tracking_error_since_).seconds());
+            replan_from_measured_state_ = true;
+            changeFSMExecState(REPLAN_TRAJ, "TRACKING_SOFT");
+            break;
+          }
+        }
+        else
+        {
+          soft_tracking_error_active_ = false;
+        }
+      }
 
       /* && (end_pt_ - pos).norm() < 0.5 */
       if ((target_type_ == TARGET_TYPE::PRESET_TARGET) &&
           (wp_id_ < waypoint_num_ - 1) &&
-          (end_pt_ - pos).norm() < no_replan_thresh_)
+          (end_pt_ - odom_pos_).norm() < no_replan_thresh_)
       {
         wp_id_++;
         planNextWaypoint(wps_[wp_id_]);
@@ -676,17 +983,46 @@ namespace ego_planner
       {
         if (t_cur > info->duration_ - 1e-2)
         {
-          have_target_ = false;
-          have_trigger_ = false;
-
-          if (target_type_ == TARGET_TYPE::PRESET_TARGET)
+          const double measured_goal_distance = (end_pt_ - odom_pos_).norm();
+          const double measured_speed = odom_vel_.norm();
+          if (measured_goal_distance <= goal_tolerance_ &&
+              measured_speed <= goal_velocity_tolerance_)
           {
-            wp_id_ = 0;
-            planNextWaypoint(wps_[wp_id_]);
-          }
+            have_target_ = false;
+            have_trigger_ = false;
 
-          changeFSMExecState(WAIT_TARGET, "FSM");
-          goto force_return;
+            if (target_type_ == TARGET_TYPE::PRESET_TARGET)
+            {
+              wp_id_ = 0;
+              planNextWaypoint(wps_[wp_id_]);
+            }
+
+            changeFSMExecState(WAIT_TARGET, "FSM");
+            goto force_return;
+          }
+          else if (measured_goal_distance > goal_tolerance_)
+          {
+            RCLCPP_WARN(
+                node_->get_logger(),
+                "Nominal trajectory ended, but measured goal distance is %.3fm "
+                "(tolerance %.3fm, speed %.3fm/s); replanning from odometry.",
+                measured_goal_distance,
+                goal_tolerance_,
+                measured_speed);
+            replan_from_measured_state_ = true;
+            changeFSMExecState(REPLAN_TRAJ, "GOAL_TRACKING");
+          }
+          else
+          {
+            RCLCPP_WARN_THROTTLE(
+                node_->get_logger(),
+                *node_->get_clock(),
+                2000,
+                "Inside goal position tolerance, waiting for measured speed %.3fm/s "
+                "to fall below %.3fm/s before completion.",
+                measured_speed,
+                goal_velocity_tolerance_);
+          }
         }
         else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_)
         {
@@ -713,6 +1049,9 @@ namespace ego_planner
         const double retry_elapsed = (rclcpp::Clock().now() - last_plan_failure_time_).seconds();
         if (
             enable_fail_safe_ &&
+            !tracking_error_emergency_latched_ &&
+            (!planner_manager_->grid_map_->observedSpaceGateEnabled() ||
+             planner_manager_->grid_map_->observedSpaceFresh()) &&
             odom_vel_.norm() < 0.1 &&
             (consecutive_plan_failures_ < max_consecutive_plan_failures_ || retry_elapsed > plan_failure_retry_delay_))
         {
@@ -795,13 +1134,47 @@ namespace ego_planner
     return true;
   }
 
+  bool EGOReplanFSM::planFromMeasuredState(const int trial_times /*=1*/)
+  {
+    start_pt_ = odom_pos_;
+    start_vel_ = odom_vel_;
+    start_acc_.setZero();
+
+    const bool flag_random_poly_init = timesOfConsecutiveStateCalls().first > 1;
+    for (int i = 0; i < trial_times; ++i)
+    {
+      if (callReboundReplan(true, flag_random_poly_init || i > 0))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
   void EGOReplanFSM::checkCollisionCallback()
   {
 
     LocalTrajData *info = &planner_manager_->local_data_;
     auto map = planner_manager_->grid_map_;
     
-    if (exec_state_ == WAIT_TARGET || info->start_time_.seconds() < 1e-5)
+    if (exec_state_ == INIT ||
+        exec_state_ == WAIT_TARGET ||
+        exec_state_ == EMERGENCY_STOP ||
+        !have_target_)
+      return;
+
+    if (map->observedSpaceGateEnabled() && !map->observedSpaceFresh())
+    {
+      RCLCPP_ERROR(
+          node_->get_logger(),
+          "Visibility cloud is stale or unavailable (age=%.3fs); emergency stop.",
+          map->observedSpaceAge());
+      replan_from_measured_state_ = false;
+      changeFSMExecState(EMERGENCY_STOP, "OBSERVED_SPACE");
+      return;
+    }
+
+    if (info->start_time_.seconds() < 1e-5)
       return;
 
     /* ---------- check lost of depth ---------- */
@@ -817,6 +1190,7 @@ namespace ego_planner
     constexpr double time_step = 0.01;
     // double t_cur = (ros::Time::now() - info->start_time_).toSec();
     double t_cur = (rclcpp::Clock().now() - info->start_time_).seconds();
+    t_cur = std::clamp(t_cur, 0.0, info->duration_);
 
     Eigen::Vector3d p_cur = info->position_traj_.evaluateDeBoorT(t_cur);
     const double CLEARANCE = 1.0 * planner_manager_->getSwarmClearance();
@@ -826,11 +1200,17 @@ namespace ego_planner
     double t_2_3 = info->duration_ * 2 / 3;
     for (double t = t_cur; t < info->duration_; t += time_step)
     {
-      if (t_cur < t_2_3 && t >= t_2_3) // If t_cur < t_2_3, only the first 2/3 partition of the trajectory is considered valid and will get checked.
+      if (!map->observedSpaceGateEnabled() &&
+          t_cur < t_2_3 && t >= t_2_3) // Preserve upstream behavior when the opt-in gate is disabled.
         break;
 
-      bool occ = false;
-      occ |= map->getInflateOccupancy(info->position_traj_.evaluateDeBoorT(t));
+      const Eigen::Vector3d trajectory_point =
+          info->position_traj_.evaluateDeBoorT(t);
+      const bool observed_space_violation =
+          map->observedSpaceGateEnabled() &&
+          !map->isObservedSpaceCovered(trajectory_point);
+      bool occ =
+          map->getInflateOccupancy(trajectory_point) != 0;
 
       for (size_t id = 0; id < planner_manager_->swarm_trajs_buf_.size(); id++)
       {
@@ -852,19 +1232,29 @@ namespace ego_planner
 
       if (occ)
       {
-
-        if (planFromCurrentTraj()) // Make a chance
+        const bool replan_success = observed_space_violation
+                                        ? planFromMeasuredState()
+                                        : planFromCurrentTraj();
+        if (replan_success)
         {
           consecutive_plan_failures_ = 0;
+          replan_from_measured_state_ = false;
           changeFSMExecState(EXEC_TRAJ, "SAFETY");
           publishSwarmTrajs(false);
           return;
         }
         else
         {
+          if (observed_space_violation)
+            replan_from_measured_state_ = true;
+
           if (t - t_cur < emergency_time_) // 0.8s of emergency time
           {
-            RCLCPP_WARN(node_->get_logger(), "Suddenly discovered obstacles. emergency stop! time=%f", t - t_cur);
+            RCLCPP_WARN(
+                node_->get_logger(),
+                "%s on the active trajectory; emergency stop in %.3fs.",
+                observed_space_violation ? "Unknown or outside observed space" : "Suddenly discovered obstacle",
+                t - t_cur);
 
             changeFSMExecState(EMERGENCY_STOP, "SAFETY");
           }
@@ -882,6 +1272,17 @@ namespace ego_planner
 
   bool EGOReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
   {
+
+    if (planner_manager_->grid_map_->observedSpaceGateEnabled() &&
+        !planner_manager_->grid_map_->observedSpaceFresh())
+    {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(),
+          *node_->get_clock(),
+          1000,
+          "Skipping replan because the visibility cloud is stale or unavailable.");
+      return false;
+    }
 
     getLocalTarget();
 
@@ -1022,6 +1423,8 @@ namespace ego_planner
 
   void EGOReplanFSM::getLocalTarget()
   {
+    const double previous_progress_time =
+        planner_manager_->global_data_.last_progress_time_;
     double t;
 
     double t_step = planning_horizen_ / 20 / planner_manager_->pp_.max_vel_;
@@ -1074,6 +1477,133 @@ namespace ego_planner
     else
     {
       local_target_vel_ = planner_manager_->global_data_.getVelocity(t);
+    }
+
+    if (planner_manager_->grid_map_->observedSpaceGateEnabled())
+    {
+      // The local target must stay inside recently observed space, otherwise the
+      // trajectory that reaches it necessarily ends in unknown space and
+      // EGOPlannerManager::validateFullObservedTrajectory() rejects every
+      // candidate. The two checks are not redundant: validation only rejects,
+      // the target is what makes a valid trajectory possible at all.
+      //
+      // Restricting the target to the straight start->reference ray, however,
+      // makes the planner refuse to move at a bend: that ray points into rock,
+      // so the reachable point lands inside reboundReplan()'s 0.2 m minimum
+      // planning distance and every replan aborts with "Close to goal". Yawing
+      // the reference direction and keeping whichever candidate reaches
+      // furthest preserves the observed-space guarantee while still giving the
+      // optimizer a usable subgoal when the goal direction itself is blocked.
+      const double stopping_distance =
+          start_vel_.squaredNorm() /
+          (2.0 * std::max(1e-3, planner_manager_->pp_.max_acc_));
+      const double effective_frontier_margin =
+          std::max(observed_space_target_margin_, stopping_distance);
+
+      Eigen::Vector3d best_reach = start_pt_;
+      double best_progress = -std::numeric_limits<double>::infinity();
+      double best_reach_distance = 0.0;
+      double best_yaw_offset_deg = 0.0;
+      bool best_was_clamped = true;
+      bool start_is_observed = true;
+
+      const Eigen::Vector3d reference_delta = local_target_pt_ - start_pt_;
+      // Candidates are scored by how far they advance along the reference
+      // direction, not by raw reach. Raw reach makes the choice near-arbitrary
+      // whenever several directions see out to the full horizon, which jitters
+      // the subgoal every replan, and it happily prefers a wide-open side
+      // chamber over the goal direction. There is no global planner to undo
+      // that wandering.
+      const Eigen::Vector3d reference_dir =
+          reference_delta.norm() > 1e-6
+              ? reference_delta.normalized()
+              : Eigen::Vector3d::Zero();
+      const int search_steps =
+          observed_space_target_search_half_angle_deg_ > 0.0
+              ? observed_space_target_search_steps_
+              : 0;
+      const double step_deg =
+          search_steps > 0
+              ? observed_space_target_search_half_angle_deg_ /
+                    static_cast<double>(search_steps)
+              : 0.0;
+
+      for (int step = 0; step <= search_steps; ++step)
+      {
+        // Straight ahead first, then alternating sides, so an equal reach keeps
+        // the candidate closest to the goal direction.
+        for (const int side : {1, -1})
+        {
+          if (step == 0 && side < 0)
+            continue;
+
+          const double yaw_offset_deg =
+              static_cast<double>(side) * step_deg * static_cast<double>(step);
+          const double yaw_offset_rad = yaw_offset_deg * M_PI / 180.0;
+          const Eigen::Vector3d candidate_delta =
+              Eigen::AngleAxisd(yaw_offset_rad, Eigen::Vector3d::UnitZ()) *
+              reference_delta;
+          const Eigen::Vector3d candidate_target = start_pt_ + candidate_delta;
+
+          Eigen::Vector3d candidate_reach = start_pt_;
+          bool candidate_clamped = true;
+          start_is_observed =
+              planner_manager_->grid_map_->clampToObservedSpace(
+                  start_pt_,
+                  candidate_target,
+                  effective_frontier_margin,
+                  candidate_reach,
+                  candidate_clamped);
+          if (!start_is_observed)
+            break;
+
+          const Eigen::Vector3d candidate_offset = candidate_reach - start_pt_;
+          const double candidate_progress =
+              candidate_offset.dot(reference_dir);
+          if (candidate_progress > best_progress)
+          {
+            best_progress = candidate_progress;
+            best_reach_distance = candidate_offset.norm();
+            best_reach = candidate_reach;
+            best_yaw_offset_deg = yaw_offset_deg;
+            best_was_clamped = candidate_clamped;
+          }
+        }
+
+        if (!start_is_observed)
+          break;
+      }
+
+      // best_reach equals the reference target exactly when the straight-ahead
+      // candidate reached it in full (0 deg is evaluated first, so it wins ties),
+      // so assigning unconditionally is a no-op in the unobstructed case and
+      // correctly adopts a rotated subgoal otherwise. Assigning only in the
+      // clamped branch would leave the unreachable reference target in place
+      // whenever a rotated candidate won, and every trajectory to it would then
+      // be rejected by full-trajectory validation.
+      local_target_pt_ = best_reach;
+
+      if (!start_is_observed || best_was_clamped ||
+          std::abs(best_yaw_offset_deg) > 1e-9)
+      {
+        planner_manager_->global_data_.last_progress_time_ =
+            previous_progress_time;
+        local_target_vel_.setZero();
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(),
+            *node_->get_clock(),
+            1000,
+            "Local target limited to observed space at [%.2f, %.2f, %.2f] with zero "
+            "terminal velocity: %.0f deg off the reference direction reached %.2fm "
+            "(frontier margin %.2fm, stopping distance %.2fm).",
+            local_target_pt_.x(),
+            local_target_pt_.y(),
+            local_target_pt_.z(),
+            best_yaw_offset_deg,
+            std::max(0.0, best_reach_distance),
+            effective_frontier_margin,
+            stopping_distance);
+      }
     }
   }
 

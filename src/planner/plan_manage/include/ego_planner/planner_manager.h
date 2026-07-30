@@ -55,6 +55,7 @@ namespace ego_planner
     fast_planner::ObjPredictor::Ptr obj_predictor_;    
     SwarmTrajData swarm_trajs_buf_;
     double terrain_max_profile_age_sec_{0.75};
+    double observed_space_validation_step_{0.05};
 
   private:
     /* main planning algorithms & modules */
@@ -72,6 +73,9 @@ namespace ego_planner
                         double &time_inc);
 
     bool refineTrajAlgo(UniformBspline &traj, vector<Eigen::Vector3d> &start_end_derivative, double ratio, double &ts, Eigen::MatrixXd &optimal_control_points);
+    bool validateFullObservedTrajectory(
+        UniformBspline &traj,
+        std::string *reason = nullptr);
 
     // !SECTION stable
 

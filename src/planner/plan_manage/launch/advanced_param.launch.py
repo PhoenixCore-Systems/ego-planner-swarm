@@ -9,6 +9,7 @@ def generate_launch_description():
     map_size_x = LaunchConfiguration('map_size_x_', default=42.0)
     map_size_y = LaunchConfiguration('map_size_y_', default=30.0)
     map_size_z = LaunchConfiguration('map_size_z_', default=5.0)
+    virtual_ceil_height = LaunchConfiguration('virtual_ceil_height', default=2.9)
     
     odometry_topic = LaunchConfiguration('odometry_topic', default='odom')
     camera_pose_topic = LaunchConfiguration('camera_pose_topic', default='camera_pose')
@@ -26,6 +27,24 @@ def generate_launch_description():
     obstacles_inflation = LaunchConfiguration('obstacles_inflation', default=0.55)
     collision_dist0 = LaunchConfiguration('collision_dist0', default=1.0)
     swarm_clearance = LaunchConfiguration('swarm_clearance', default=1.0)
+    tracking_error_monitor_enabled = LaunchConfiguration(
+        'tracking_error_monitor_enabled', default=True)
+    tracking_error_soft_threshold = LaunchConfiguration(
+        'tracking_error_soft_threshold', default=0.5)
+    tracking_error_hard_threshold = LaunchConfiguration(
+        'tracking_error_hard_threshold', default=1.0)
+    tracking_error_soft_duration = LaunchConfiguration(
+        'tracking_error_soft_duration', default=0.25)
+    tracking_error_hard_duration = LaunchConfiguration(
+        'tracking_error_hard_duration', default=0.10)
+    stall_commanded_speed = LaunchConfiguration(
+        'stall_commanded_speed', default=0.15)
+    stall_measured_speed = LaunchConfiguration(
+        'stall_measured_speed', default=0.05)
+    stall_duration = LaunchConfiguration('stall_duration', default=2.0)
+    goal_tolerance = LaunchConfiguration('goal_tolerance', default=0.3)
+    goal_velocity_tolerance = LaunchConfiguration(
+        'goal_velocity_tolerance', default=0.2)
     terrain_ref_enabled = LaunchConfiguration('terrain_ref_enabled', default=True)
     terrain_ref_lambda = LaunchConfiguration('terrain_ref_lambda', default=4.0)
     terrain_band_lambda = LaunchConfiguration('terrain_band_lambda', default=12.0)
@@ -57,13 +76,52 @@ def generate_launch_description():
     use_distinctive_trajs = LaunchConfiguration('use_distinctive_trajs', default=True)
     
     obj_num_set = LaunchConfiguration('obj_num_set', default=10)
-    
+
     drone_id = LaunchConfiguration('drone_id', default=0)
+    planning_frame = LaunchConfiguration('planning_frame')
+    observed_space_enabled = LaunchConfiguration(
+        'observed_space_enabled', default=False)
+    observed_space_timeout = LaunchConfiguration(
+        'observed_space_timeout', default=0.5)
+    observed_space_retention = LaunchConfiguration(
+        'observed_space_retention', default=0.5)
+    observed_space_clearance = LaunchConfiguration(
+        'observed_space_clearance', default=0.0)
+    observed_space_ray_dilation_voxels = LaunchConfiguration(
+        'observed_space_ray_dilation_voxels', default=0)
+    observed_space_seed_radius = LaunchConfiguration(
+        'observed_space_seed_radius', default=0.45)
+    observed_space_min_update_interval = LaunchConfiguration(
+        'observed_space_min_update_interval', default=0.0)
+    observed_space_resolution = LaunchConfiguration(
+        'observed_space_resolution', default=0.0)
+    observed_space_target_search_half_angle_deg = LaunchConfiguration(
+        'observed_space_target_search_half_angle_deg', default=60.0)
+    observed_space_target_search_steps = LaunchConfiguration(
+        'observed_space_target_search_steps', default=3)
+    observed_space_target_margin = LaunchConfiguration(
+        'observed_space_target_margin', default=0.0)
+    observed_space_validation_step = LaunchConfiguration(
+        'observed_space_validation_step', default=0.05)
+    local_update_range_xy = LaunchConfiguration(
+        'local_update_range_xy', default=5.5)
+    local_update_range_z = LaunchConfiguration(
+        'local_update_range_z', default=4.5)
+    max_ray_length = LaunchConfiguration('max_ray_length', default=4.5)
+    visibility_cloud_topic = LaunchConfiguration(
+        'visibility_cloud_topic', default='/planning/visibility_endpoints')
+    visibility_origin_topic = LaunchConfiguration(
+        'visibility_origin_topic', default='/planning/visibility_origin')
 
     # DeclareLaunchArguments
     map_size_x_arg = DeclareLaunchArgument('map_size_x_', default_value=map_size_x, description='Map size along X')
     map_size_y_arg = DeclareLaunchArgument('map_size_y_', default_value=map_size_y, description='Map size along Y')
     map_size_z_arg = DeclareLaunchArgument('map_size_z_', default_value=map_size_z, description='Map size along Z')
+    virtual_ceil_height_arg = DeclareLaunchArgument(
+        'virtual_ceil_height',
+        default_value=virtual_ceil_height,
+        description='Occupied virtual ceiling height in the map frame',
+    )
     odometry_topic_arg = DeclareLaunchArgument('odometry_topic', default_value=odometry_topic, description='Odometry topic')
     camera_pose_topic_arg = DeclareLaunchArgument('camera_pose_topic', default_value=camera_pose_topic, description='Camera pose topic')
     depth_topic_arg = DeclareLaunchArgument('depth_topic', default_value=depth_topic, description='Depth topic')
@@ -90,6 +148,41 @@ def generate_launch_description():
         default_value=swarm_clearance,
         description='EGO swarm clearance distance',
     )
+    tracking_error_monitor_enabled_arg = DeclareLaunchArgument(
+        'tracking_error_monitor_enabled',
+        default_value=tracking_error_monitor_enabled,
+        description='Enable odometry-versus-nominal trajectory divergence monitoring',
+    )
+    tracking_error_soft_threshold_arg = DeclareLaunchArgument(
+        'tracking_error_soft_threshold',
+        default_value=tracking_error_soft_threshold,
+        description='Position error that requests a measured-state replan',
+    )
+    tracking_error_hard_threshold_arg = DeclareLaunchArgument(
+        'tracking_error_hard_threshold',
+        default_value=tracking_error_hard_threshold,
+        description='Position error that latches an emergency stop until a new goal',
+    )
+    tracking_error_soft_duration_arg = DeclareLaunchArgument(
+        'tracking_error_soft_duration',
+        default_value=tracking_error_soft_duration,
+        description='Time above the soft tracking threshold before replanning',
+    )
+    tracking_error_hard_duration_arg = DeclareLaunchArgument(
+        'tracking_error_hard_duration',
+        default_value=tracking_error_hard_duration,
+        description='Time above the hard tracking threshold before emergency stop',
+    )
+    goal_tolerance_arg = DeclareLaunchArgument(
+        'goal_tolerance',
+        default_value=goal_tolerance,
+        description='Measured 3D distance required for goal completion',
+    )
+    goal_velocity_tolerance_arg = DeclareLaunchArgument(
+        'goal_velocity_tolerance',
+        default_value=goal_velocity_tolerance,
+        description='Measured speed required for goal completion',
+    )
     terrain_ref_enabled_arg = DeclareLaunchArgument(
         'terrain_ref_enabled',
         default_value=terrain_ref_enabled,
@@ -113,7 +206,7 @@ def generate_launch_description():
     terrain_max_profile_age_arg = DeclareLaunchArgument(
         'terrain_max_profile_age_sec',
         default_value=terrain_max_profile_age_sec,
-        description='Maximum terrain profile age before rejecting a plan',
+        description='Maximum profile age for hard-floor validation; current stale behavior fails open',
     )
     terrain_max_lateral_arg = DeclareLaunchArgument(
         'terrain_max_lateral_m',
@@ -157,6 +250,104 @@ def generate_launch_description():
     use_distinctive_trajs_arg = DeclareLaunchArgument('use_distinctive_trajs', default_value=use_distinctive_trajs, description='Use distinctive trajectories')
     obj_num_set_arg = DeclareLaunchArgument('obj_num_set', default_value=obj_num_set, description='Number of objects')
     drone_id_arg = DeclareLaunchArgument('drone_id', default_value=drone_id, description='Drone ID')
+    planning_frame_arg = DeclareLaunchArgument(
+        'planning_frame',
+        default_value='world',
+        description='Frame used for EGO planning-map and visualization outputs',
+    )
+    observed_space_enabled_arg = DeclareLaunchArgument(
+        'observed_space_enabled',
+        default_value=observed_space_enabled,
+        description='Opt in to fail-closed recent observed-space planning',
+    )
+    observed_space_timeout_arg = DeclareLaunchArgument(
+        'observed_space_timeout',
+        default_value=observed_space_timeout,
+        description='Maximum visibility stream age before emergency stop',
+    )
+    observed_space_retention_arg = DeclareLaunchArgument(
+        'observed_space_retention',
+        default_value=observed_space_retention,
+        description='Recent visibility-ray history retained as observed free',
+    )
+    observed_space_clearance_arg = DeclareLaunchArgument(
+        'observed_space_clearance',
+        default_value=observed_space_clearance,
+        description='Physical clearance required inside observed free space',
+    )
+    observed_space_ray_dilation_arg = DeclareLaunchArgument(
+        'observed_space_ray_dilation_voxels',
+        default_value=observed_space_ray_dilation_voxels,
+        description='Raster-only visibility ray tolerance in voxels (0 or 1)',
+    )
+    observed_space_seed_radius_arg = DeclareLaunchArgument(
+        'observed_space_seed_radius',
+        default_value=observed_space_seed_radius,
+        description='Observed seed sphere around each sensor origin',
+    )
+    observed_space_target_search_half_angle_deg_arg = DeclareLaunchArgument(
+        'observed_space_target_search_half_angle_deg',
+        default_value=observed_space_target_search_half_angle_deg,
+        description='Half-angle for the observed-space local target direction search (deg, 0 = straight ray only)')
+    observed_space_target_search_steps_arg = DeclareLaunchArgument(
+        'observed_space_target_search_steps',
+        default_value=observed_space_target_search_steps,
+        description='Yaw offsets tried per side during the local target direction search')
+    observed_space_resolution_arg = DeclareLaunchArgument(
+        'observed_space_resolution',
+        default_value=observed_space_resolution,
+        description='Visibility mask voxel size (m, 0 = grid_map/resolution); must exceed LiDAR beam separation at the planning horizon')
+    observed_space_min_update_interval_arg = DeclareLaunchArgument(
+        'observed_space_min_update_interval',
+        default_value=observed_space_min_update_interval,
+        description='Minimum seconds between integrated visibility frames (0 = every frame)')
+    stall_commanded_speed_arg = DeclareLaunchArgument(
+        'stall_commanded_speed',
+        default_value=stall_commanded_speed,
+        description='Commanded speed above which a stalled vehicle is judged (m/s)')
+    stall_measured_speed_arg = DeclareLaunchArgument(
+        'stall_measured_speed',
+        default_value=stall_measured_speed,
+        description='Measured speed below which the vehicle counts as stalled (m/s)')
+    stall_duration_arg = DeclareLaunchArgument(
+        'stall_duration',
+        default_value=stall_duration,
+        description='Seconds of commanded-but-not-moving before latching HOLD')
+    observed_space_target_margin_arg = DeclareLaunchArgument(
+        'observed_space_target_margin',
+        default_value=observed_space_target_margin,
+        description='Distance to back off from an unknown local frontier',
+    )
+    observed_space_validation_step_arg = DeclareLaunchArgument(
+        'observed_space_validation_step',
+        default_value=observed_space_validation_step,
+        description='Spatial sampling step for full B-spline safety validation',
+    )
+    local_update_range_xy_arg = DeclareLaunchArgument(
+        'local_update_range_xy',
+        default_value=local_update_range_xy,
+        description='Independent-cloud local map half-range in X and Y',
+    )
+    local_update_range_z_arg = DeclareLaunchArgument(
+        'local_update_range_z',
+        default_value=local_update_range_z,
+        description='Independent-cloud local map half-range in Z',
+    )
+    max_ray_length_arg = DeclareLaunchArgument(
+        'max_ray_length',
+        default_value=max_ray_length,
+        description='Maximum visibility ray length',
+    )
+    visibility_cloud_topic_arg = DeclareLaunchArgument(
+        'visibility_cloud_topic',
+        default_value=visibility_cloud_topic,
+        description='Measured visibility endpoint cloud',
+    )
+    visibility_origin_topic_arg = DeclareLaunchArgument(
+        'visibility_origin_topic',
+        default_value=visibility_origin_topic,
+        description='Same-stamp visibility sensor origin',
+    )
 
     # Ego Planner Node
     ego_planner_node = Node(
@@ -167,6 +358,7 @@ def generate_launch_description():
         remappings=[
             ('odom_world', ['drone_', drone_id, '_', odometry_topic]),
             ('planning/bspline', ['drone_', drone_id, '_planning/bspline']),
+            ('planning/cancel', ['drone_', drone_id, '_planning/cancel']),
             ('planning/data_display', ['drone_', drone_id, '_planning/data_display']),
             ('planning/broadcast_bspline_from_planner', '/broadcast_bspline'),
             ('planning/broadcast_bspline_to_planner', '/broadcast_bspline'),
@@ -179,6 +371,8 @@ def generate_launch_description():
             
             ('grid_map/odom', ['drone_', drone_id, '_', odometry_topic]),
             ('grid_map/cloud', ['drone_', drone_id, '_', cloud_topic]),
+            ('grid_map/visibility_cloud', visibility_cloud_topic),
+            ('grid_map/visibility_origin', visibility_origin_topic),
             ('grid_map/pose', ['drone_', drone_id, '_', camera_pose_topic]),
             ('grid_map/depth', ['drone_', drone_id, '_', depth_topic]),
             ('grid_map/occupancy_inflate', ['drone_', drone_id, '_grid/grid_map/occupancy_inflate'])
@@ -192,7 +386,20 @@ def generate_launch_description():
             {'fsm/emergency_time': 1.0},
             {'fsm/realworld_experiment': False},
             {'fsm/fail_safe': True},
-            
+            {'fsm/tracking_error_monitor_enabled': tracking_error_monitor_enabled},
+            {'fsm/tracking_error_soft_threshold': tracking_error_soft_threshold},
+            {'fsm/tracking_error_hard_threshold': tracking_error_hard_threshold},
+            {'fsm/tracking_error_soft_duration': tracking_error_soft_duration},
+            {'fsm/tracking_error_hard_duration': tracking_error_hard_duration},
+            {'fsm/goal_tolerance': goal_tolerance},
+            {'fsm/goal_velocity_tolerance': goal_velocity_tolerance},
+            {'fsm/stall_commanded_speed': stall_commanded_speed},
+            {'fsm/stall_measured_speed': stall_measured_speed},
+            {'fsm/stall_duration': stall_duration},
+            {'fsm/observed_space_target_margin': observed_space_target_margin},
+            {'fsm/observed_space_target_search_half_angle_deg': observed_space_target_search_half_angle_deg},
+            {'fsm/observed_space_target_search_steps': observed_space_target_search_steps},
+
             {'fsm/waypoint_num': point_num},
             {'fsm/waypoint0_x': point0_x},
             {'fsm/waypoint0_y': point0_y},
@@ -214,9 +421,9 @@ def generate_launch_description():
             {'grid_map/map_size_x': map_size_x},
             {'grid_map/map_size_y': map_size_y},
             {'grid_map/map_size_z': map_size_z},
-            {'grid_map/local_update_range_x': 5.5},
-            {'grid_map/local_update_range_y': 5.5},
-            {'grid_map/local_update_range_z': 4.5},
+            {'grid_map/local_update_range_x': local_update_range_xy},
+            {'grid_map/local_update_range_y': local_update_range_xy},
+            {'grid_map/local_update_range_z': local_update_range_z},
             {'grid_map/obstacles_inflation': obstacles_inflation},
             {'grid_map/local_map_margin': 10},
             {'grid_map/ground_height': -0.01},
@@ -240,13 +447,22 @@ def generate_launch_description():
             {'grid_map/p_max': 0.90},
             {'grid_map/p_occ': 0.80},
             {'grid_map/min_ray_length': 0.1},
-            {'grid_map/max_ray_length': 4.5},
+            {'grid_map/max_ray_length': max_ray_length},
+            {'grid_map/observed_space_enabled': observed_space_enabled},
+            {'grid_map/observed_space_timeout': observed_space_timeout},
+            {'grid_map/observed_space_retention': observed_space_retention},
+            {'grid_map/observed_space_clearance': observed_space_clearance},
+            {'grid_map/observed_space_ray_dilation_voxels': observed_space_ray_dilation_voxels},
+            {'grid_map/observed_space_seed_radius': observed_space_seed_radius},
+            {'grid_map/observed_space_min_update_interval': observed_space_min_update_interval},
+            {'grid_map/observed_space_resolution': observed_space_resolution},
             
-            {'grid_map/virtual_ceil_height': 2.9},
+            {'grid_map/virtual_ceil_height': virtual_ceil_height},
             {'grid_map/visualization_truncate_height': 1.8},
             {'grid_map/show_occ_time': False},
             {'grid_map/pose_type': 1},
-            {'grid_map/frame_id': "world"},
+            {'grid_map/frame_id': planning_frame},
+            {'visualization/frame_id': planning_frame},
             # planner manager
             {'manager/max_vel': max_vel},
             {'manager/max_acc': max_acc},
@@ -256,6 +472,7 @@ def generate_launch_description():
             {'manager/planning_horizon': planning_horizon},
             {'manager/use_distinctive_trajs': use_distinctive_trajs},
             {'manager/drone_id': drone_id},
+            {'manager/observed_space_validation_step': observed_space_validation_step},
             # Trajectory optimization parameters
             {'optimization/lambda_smooth': 1.0},
             {'optimization/lambda_collision': 0.5},
@@ -294,6 +511,7 @@ def generate_launch_description():
     ld.add_action(map_size_x_arg)
     ld.add_action(map_size_y_arg)
     ld.add_action(map_size_z_arg)
+    ld.add_action(virtual_ceil_height_arg)
     ld.add_action(odometry_topic_arg)
     ld.add_action(camera_pose_topic_arg)
     ld.add_action(depth_topic_arg)
@@ -308,6 +526,13 @@ def generate_launch_description():
     ld.add_action(obstacles_inflation_arg)
     ld.add_action(collision_dist0_arg)
     ld.add_action(swarm_clearance_arg)
+    ld.add_action(tracking_error_monitor_enabled_arg)
+    ld.add_action(tracking_error_soft_threshold_arg)
+    ld.add_action(tracking_error_hard_threshold_arg)
+    ld.add_action(tracking_error_soft_duration_arg)
+    ld.add_action(tracking_error_hard_duration_arg)
+    ld.add_action(goal_tolerance_arg)
+    ld.add_action(goal_velocity_tolerance_arg)
     ld.add_action(terrain_ref_enabled_arg)
     ld.add_action(terrain_ref_lambda_arg)
     ld.add_action(terrain_band_lambda_arg)
@@ -339,6 +564,27 @@ def generate_launch_description():
     ld.add_action(use_distinctive_trajs_arg)
     ld.add_action(obj_num_set_arg)
     ld.add_action(drone_id_arg)
+    ld.add_action(planning_frame_arg)
+    ld.add_action(observed_space_enabled_arg)
+    ld.add_action(observed_space_timeout_arg)
+    ld.add_action(observed_space_retention_arg)
+    ld.add_action(observed_space_clearance_arg)
+    ld.add_action(observed_space_ray_dilation_arg)
+    ld.add_action(observed_space_seed_radius_arg)
+    ld.add_action(observed_space_target_search_half_angle_deg_arg)
+    ld.add_action(observed_space_target_search_steps_arg)
+    ld.add_action(observed_space_resolution_arg)
+    ld.add_action(observed_space_min_update_interval_arg)
+    ld.add_action(stall_commanded_speed_arg)
+    ld.add_action(stall_measured_speed_arg)
+    ld.add_action(stall_duration_arg)
+    ld.add_action(observed_space_target_margin_arg)
+    ld.add_action(observed_space_validation_step_arg)
+    ld.add_action(local_update_range_xy_arg)
+    ld.add_action(local_update_range_z_arg)
+    ld.add_action(max_ray_length_arg)
+    ld.add_action(visibility_cloud_topic_arg)
+    ld.add_action(visibility_origin_topic_arg)
 
 
     # Add Node

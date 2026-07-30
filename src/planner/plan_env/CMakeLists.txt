@@ -17,6 +17,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -29,6 +30,7 @@ find_package(PCL REQUIRED)
 find_package(pcl_conversions REQUIRED)
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
@@ -54,21 +56,34 @@ ament_export_include_directories(include)
 
 add_library( plan_env SHARED
     src/grid_map.cpp 
+    src/observed_space.cpp
     src/raycast.cpp
     src/obj_predictor.cpp 
     )
 
-ament_target_dependencies(plan_env std_msgs visualization_msgs geometry_msgs nav_msgs rclcpp Eigen3 PCL cv_bridge message_filters pcl_conversions)
+ament_target_dependencies(plan_env std_msgs sensor_msgs visualization_msgs geometry_msgs nav_msgs rclcpp Eigen3 PCL cv_bridge message_filters pcl_conversions)
 
 target_link_libraries( plan_env 
   ${PCL_LIBRARIES}
   ${OpenCV_LIBS}
 )  
 
+if(BUILD_TESTING)
+  ament_add_gtest(test_observed_space
+    test/test_observed_space.cpp
+    src/observed_space.cpp
+    src/raycast.cpp
+  )
+  target_include_directories(test_observed_space PRIVATE
+    include
+    ${Eigen3_INCLUDE_DIRS}
+  )
+endif()
+
 add_executable(obj_generator
     src/obj_generator.cpp 
 )
-ament_target_dependencies(obj_generator std_msgs visualization_msgs geometry_msgs nav_msgs rclcpp Eigen3 PCL cv_bridge message_filters pcl_conversions)
+ament_target_dependencies(obj_generator std_msgs sensor_msgs visualization_msgs geometry_msgs nav_msgs rclcpp Eigen3 PCL cv_bridge message_filters pcl_conversions)
 
 install(TARGETS plan_env
         DESTINATION lib

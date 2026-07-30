@@ -32,7 +32,9 @@ rosidl_generate_interfaces(traj_utils
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
+  find_package(rosgraph_msgs REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
@@ -60,6 +62,27 @@ add_library( traj_utils_lib SHARED
     )
 
 ament_target_dependencies(traj_utils_lib std_msgs geometry_msgs visualization_msgs rclcpp Eigen3 PCL)
+
+if(BUILD_TESTING)
+  ament_add_gtest(
+    test_planning_visualization
+    test/test_planning_visualization.cpp
+  )
+  if(TARGET test_planning_visualization)
+    target_link_libraries(test_planning_visualization traj_utils_lib)
+    ament_target_dependencies(
+      test_planning_visualization
+      rclcpp
+      rosgraph_msgs
+      visualization_msgs
+    )
+    # Never let the test clock publisher join a live bench/SITL ROS graph.
+    set_tests_properties(
+      test_planning_visualization
+      PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=231"
+    )
+  endif()
+endif()
 
 install(TARGETS traj_utils_lib
         DESTINATION lib

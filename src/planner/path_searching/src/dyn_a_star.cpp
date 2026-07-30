@@ -13,6 +13,8 @@ AStar::~AStar()
 
 void AStar::initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size)
 {
+    PLAN_ENV_ASSERT_GRID_MAP_ABI();
+
     POOL_SIZE_ = pool_size;
     CENTER_IDX_ = pool_size / 2;
 

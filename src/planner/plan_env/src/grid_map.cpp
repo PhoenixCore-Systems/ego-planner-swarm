@@ -1,5 +1,11 @@
 #include "plan_env/grid_map.h"
 
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
 // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
 
@@ -45,6 +51,14 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/local_map_margin", 1);
   node_->declare_parameter("grid_map/ground_height", 1.0);
   node_->declare_parameter("grid_map/odom_depth_timeout", 1.0);
+  node_->declare_parameter("grid_map/observed_space_enabled", false);
+  node_->declare_parameter("grid_map/observed_space_timeout", 0.5);
+  node_->declare_parameter("grid_map/observed_space_retention", 0.5);
+  node_->declare_parameter("grid_map/observed_space_clearance", 0.0);
+  node_->declare_parameter("grid_map/observed_space_ray_dilation_voxels", 0);
+  node_->declare_parameter("grid_map/observed_space_seed_radius", 0.45);
+  node_->declare_parameter("grid_map/observed_space_min_update_interval", 0.0);
+  node_->declare_parameter("grid_map/observed_space_resolution", 0.0);
 
   node_->get_parameter("grid_map/resolution", mp_.resolution_);
   node_->get_parameter("grid_map/map_size_x", x_size);
@@ -82,6 +96,61 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/local_map_margin", mp_.local_map_margin_);
   node_->get_parameter("grid_map/ground_height", mp_.ground_height_);
   node_->get_parameter("grid_map/odom_depth_timeout", mp_.odom_depth_timeout_);
+  node_->get_parameter("grid_map/observed_space_enabled", mp_.observed_space_enabled_);
+  node_->get_parameter("grid_map/observed_space_timeout", mp_.observed_space_timeout_);
+  node_->get_parameter("grid_map/observed_space_retention", mp_.observed_space_retention_);
+  node_->get_parameter("grid_map/observed_space_clearance", mp_.observed_space_clearance_);
+  node_->get_parameter(
+      "grid_map/observed_space_ray_dilation_voxels",
+      mp_.observed_space_ray_dilation_voxels_);
+  node_->get_parameter("grid_map/observed_space_seed_radius", mp_.observed_space_seed_radius_);
+  node_->get_parameter(
+      "grid_map/observed_space_min_update_interval",
+      mp_.observed_space_min_update_interval_);
+  node_->get_parameter(
+      "grid_map/observed_space_resolution",
+      mp_.observed_space_resolution_);
+
+  if (mp_.observed_space_enabled_ &&
+      (!std::isfinite(mp_.observed_space_resolution_) ||
+       mp_.observed_space_resolution_ < 0.0))
+  {
+    throw std::invalid_argument(
+        "grid_map/observed_space_resolution must be non-negative "
+        "(0 follows grid_map/resolution).");
+  }
+
+  if (mp_.observed_space_enabled_ &&
+      (!std::isfinite(mp_.observed_space_min_update_interval_) ||
+       mp_.observed_space_min_update_interval_ < 0.0 ||
+       mp_.observed_space_min_update_interval_ >=
+           mp_.observed_space_retention_))
+  {
+    throw std::invalid_argument(
+        "grid_map/observed_space_min_update_interval must be non-negative and "
+        "strictly shorter than grid_map/observed_space_retention, otherwise "
+        "retained coverage expires between integrated frames.");
+  }
+
+  if (mp_.observed_space_enabled_ &&
+      (!std::isfinite(mp_.observed_space_timeout_) ||
+       mp_.observed_space_timeout_ <= 0.0 ||
+       !std::isfinite(mp_.observed_space_retention_) ||
+       mp_.observed_space_retention_ <= 0.0 ||
+       mp_.observed_space_retention_ > 5.0 ||
+       !std::isfinite(mp_.observed_space_clearance_) ||
+       mp_.observed_space_clearance_ < 0.0 ||
+       mp_.observed_space_ray_dilation_voxels_ < 0 ||
+       mp_.observed_space_ray_dilation_voxels_ > 1 ||
+       !std::isfinite(mp_.observed_space_seed_radius_) ||
+       mp_.observed_space_seed_radius_ < 0.0 ||
+       !std::isfinite(mp_.max_ray_length_) ||
+       mp_.max_ray_length_ <= 0.0))
+  {
+    throw std::invalid_argument(
+        "Observed-space safety requires positive timeout/retention/max ray length, "
+        "retention <= 5s, non-negative clearance/seed radius, and ray dilation in [0, 1].");
+  }
 
   if (mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
   {
@@ -117,6 +186,42 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
 
   md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
+
+  if (mp_.observed_space_enabled_)
+  {
+    // Zero means "follow the obstacle map", which is only correct when the beam
+    // separation at the planning horizon is finer than the obstacle resolution.
+    const double observed_resolution =
+        mp_.observed_space_resolution_ > 0.0
+            ? mp_.observed_space_resolution_
+            : mp_.resolution_;
+    Eigen::Vector3i observed_voxel_num;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+      observed_voxel_num(axis) = std::max(
+          1,
+          static_cast<int>(
+              std::ceil(mp_.map_size_(axis) / observed_resolution)));
+    }
+
+    observed_space_.configure(
+        mp_.map_origin_,
+        observed_voxel_num,
+        observed_resolution,
+        mp_.observed_space_retention_,
+        mp_.observed_space_ray_dilation_voxels_,
+        mp_.observed_space_seed_radius_);
+
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "Observed-space mask: resolution=%.2fm voxels=%dx%dx%d "
+        "(obstacle map resolution=%.2fm)",
+        observed_resolution,
+        observed_voxel_num.x(),
+        observed_voxel_num.y(),
+        observed_voxel_num.z(),
+        mp_.resolution_);
+  }
 
   md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
   md_.count_hit_ = vector<short>(buffer_size, 0);
@@ -170,6 +275,50 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
 
   indep_odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
       "grid_map/odom", 10, std::bind(&GridMap::odomCallback, this, std::placeholders::_1));
+
+  if (mp_.observed_space_enabled_)
+  {
+    // Visibility is a safety sensor stream, not map history. Keeping only the
+    // latest pair prevents reliable DDS backlog from replaying an old scan as
+    // current observed free space; the source-stamp age check remains the
+    // final fail-closed guard.
+    auto visibility_qos = rclcpp::QoS(rclcpp::KeepLast(1));
+    visibility_qos.best_effort();
+    visibility_cloud_sub_ =
+        std::make_shared<message_filters::Subscriber<sensor_msgs::msg::PointCloud2>>(
+            node_,
+            "grid_map/visibility_cloud",
+            visibility_qos.get_rmw_qos_profile());
+    visibility_origin_sub_ =
+        std::make_shared<message_filters::Subscriber<geometry_msgs::msg::PointStamped>>(
+            node_,
+            "grid_map/visibility_origin",
+            visibility_qos.get_rmw_qos_profile());
+    sync_visibility_ =
+        std::make_shared<message_filters::Synchronizer<SyncPolicyVisibility>>(
+            SyncPolicyVisibility(2),
+            *visibility_cloud_sub_,
+            *visibility_origin_sub_);
+    sync_visibility_->registerCallback(
+        std::bind(
+            &GridMap::visibilityCallback,
+            this,
+            std::placeholders::_1,
+            std::placeholders::_2));
+
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "Observed-space safety enabled: timeout=%.2fs retention=%.2fs "
+        "clearance=%.2fm ray_dilation=%d seed_radius=%.2fm max_ray=%.2fm "
+        "min_update_interval=%.2fs",
+        mp_.observed_space_timeout_,
+        mp_.observed_space_retention_,
+        mp_.observed_space_clearance_,
+        mp_.observed_space_ray_dilation_voxels_,
+        mp_.observed_space_seed_radius_,
+        mp_.max_ray_length_,
+        mp_.observed_space_min_update_interval_);
+  }
 
   // 定时器
   occ_timer_ = node_->create_wall_timer(
@@ -912,6 +1061,281 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
         md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
       }
   }
+}
+
+void GridMap::visibilityCallback(
+    const sensor_msgs::msg::PointCloud2::ConstPtr &cloud,
+    const geometry_msgs::msg::PointStamped::ConstPtr &origin)
+{
+  if (!mp_.observed_space_enabled_)
+    return;
+
+  const auto normalize_frame = [](std::string frame)
+  {
+    while (!frame.empty() && frame.front() == '/')
+      frame.erase(frame.begin());
+    return frame;
+  };
+  const std::string cloud_frame = normalize_frame(cloud->header.frame_id);
+  const std::string origin_frame = normalize_frame(origin->header.frame_id);
+  const std::string planning_frame = normalize_frame(mp_.frame_id_);
+  if (cloud_frame.empty() ||
+      cloud_frame != origin_frame ||
+      cloud_frame != planning_frame)
+  {
+    RCLCPP_ERROR_THROTTLE(
+        node_->get_logger(),
+        *node_->get_clock(),
+        2000,
+        "Rejecting visibility pair with frame mismatch: cloud='%s' origin='%s' planning='%s'.",
+        cloud_frame.c_str(),
+        origin_frame.c_str(),
+        planning_frame.c_str());
+    return;
+  }
+
+  const Eigen::Vector3d sensor_origin(
+      origin->point.x,
+      origin->point.y,
+      origin->point.z);
+  if (!sensor_origin.allFinite())
+  {
+    RCLCPP_ERROR_THROTTLE(
+        node_->get_logger(),
+        *node_->get_clock(),
+        2000,
+        "Rejecting visibility pair with a non-finite sensor origin.");
+    return;
+  }
+
+  pcl::PointCloud<pcl::PointXYZ> endpoint_cloud;
+  pcl::fromROSMsg(*cloud, endpoint_cloud);
+  std::vector<Eigen::Vector3d> endpoints;
+  endpoints.reserve(endpoint_cloud.points.size());
+  for (const auto &point : endpoint_cloud.points)
+  {
+    const Eigen::Vector3d endpoint(point.x, point.y, point.z);
+    if (endpoint.allFinite())
+      endpoints.push_back(endpoint);
+  }
+
+  if (cloud->header.stamp.sec == 0 &&
+      cloud->header.stamp.nanosec == 0)
+  {
+    RCLCPP_ERROR_THROTTLE(
+        node_->get_logger(),
+        *node_->get_clock(),
+        2000,
+        "Rejecting visibility pair without a source timestamp.");
+    return;
+  }
+
+  const double now_sec = node_->now().seconds();
+  const double source_stamp_sec =
+      rclcpp::Time(cloud->header.stamp).seconds();
+  const double source_age_sec = now_sec - source_stamp_sec;
+  constexpr double kFutureStampToleranceSec = 0.05;
+  if (!std::isfinite(source_stamp_sec) ||
+      !std::isfinite(source_age_sec) ||
+      source_age_sec > mp_.observed_space_timeout_ ||
+      source_age_sec < -kFutureStampToleranceSec)
+  {
+    RCLCPP_ERROR_THROTTLE(
+        node_->get_logger(),
+        *node_->get_clock(),
+        2000,
+        "Rejecting stale or clock-mismatched visibility pair: source_age=%.3fs timeout=%.3fs.",
+        source_age_sec,
+        mp_.observed_space_timeout_);
+    return;
+  }
+
+  // Clamp only a tiny source-clock lead. Retention and freshness otherwise use
+  // the sensor stamp, so queued old reliable samples cannot refresh the gate.
+  const double observation_time_sec =
+      std::min(source_stamp_sec, now_sec);
+
+  // Ray integration costs tens of milliseconds and runs on the same
+  // single-threaded executor as the EGO FSM and safety timers, so every
+  // integrated frame is time the planner cannot use. Skipping frames that
+  // arrive faster than this interval bounds that duty cycle. Retention must
+  // stay longer than the interval or coverage will flicker, which
+  // observedSpaceFresh() reports as stale and the planner fails closed on.
+  if (has_integrated_observed_space_ &&
+      mp_.observed_space_min_update_interval_ > 0.0 &&
+      observation_time_sec - last_observed_space_integration_sec_ <
+          mp_.observed_space_min_update_interval_ &&
+      observation_time_sec >= last_observed_space_integration_sec_)
+  {
+    RCLCPP_DEBUG(
+        node_->get_logger(),
+        "Skipping visibility frame %.3fs after the last integration (minimum interval %.3fs).",
+        observation_time_sec - last_observed_space_integration_sec_,
+        mp_.observed_space_min_update_interval_);
+    return;
+  }
+
+  const auto update_start = std::chrono::steady_clock::now();
+  const auto stats = observed_space_.addObservation(
+      sensor_origin,
+      endpoints,
+      observation_time_sec,
+      mp_.min_ray_length_,
+      mp_.max_ray_length_);
+  const double update_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - update_start)
+          .count();
+  if (!stats.sensor_origin_in_map)
+  {
+    RCLCPP_ERROR_THROTTLE(
+        node_->get_logger(),
+        *node_->get_clock(),
+        2000,
+        "Discarded visibility frame: sensor origin [%.2f, %.2f, %.2f] is outside "
+        "the grid map, so no ray could be traced (endpoints=%zu). Observed space "
+        "will go stale and fail closed until the origin is inside the map.",
+        sensor_origin.x(),
+        sensor_origin.y(),
+        sensor_origin.z(),
+        stats.endpoint_count);
+    return;
+  }
+
+  RCLCPP_INFO_THROTTLE(
+      node_->get_logger(),
+      *node_->get_clock(),
+      5000,
+      "Observed-space update accepted: source_age=%.3fs endpoints=%zu "
+      "rays=%zu frame_voxels=%zu retained_voxels=%zu update=%.1fms.",
+      source_age_sec,
+      stats.endpoint_count,
+      stats.accepted_ray_count,
+      stats.frame_voxel_count,
+      stats.retained_voxel_count,
+      update_ms);
+
+  last_observed_space_integration_sec_ = observation_time_sec;
+  has_integrated_observed_space_ = true;
+  // An accepted frame is itself a cycle boundary, so the coverage snapshot can
+  // be refreshed without another clock read.
+  observed_space_fresh_snapshot_ = true;
+
+  RCLCPP_DEBUG(
+      node_->get_logger(),
+      "Observed-space update: endpoints=%zu accepted_rays=%zu frame_voxels=%zu retained_voxels=%zu",
+      stats.endpoint_count,
+      stats.accepted_ray_count,
+      stats.frame_voxel_count,
+      stats.retained_voxel_count);
+}
+
+double GridMap::observedSpaceAge() const
+{
+  if (!mp_.observed_space_enabled_ || !observed_space_.hasObservation())
+    return std::numeric_limits<double>::infinity();
+  return node_->now().seconds() - observed_space_.lastObservationTime();
+}
+
+bool GridMap::observedSpaceFresh()
+{
+  if (!mp_.observed_space_enabled_)
+    return true;
+
+  const double now_sec = node_->now().seconds();
+  observed_space_.expire(now_sec);
+
+  bool fresh = false;
+  if (observed_space_.hasObservation())
+  {
+    const double age = now_sec - observed_space_.lastObservationTime();
+    fresh = std::isfinite(age) && age >= 0.0 &&
+            age <= mp_.observed_space_timeout_;
+  }
+
+  observed_space_fresh_snapshot_ = fresh;
+  return fresh;
+}
+
+bool GridMap::isObservedSpaceCovered(const Eigen::Vector3d &pos)
+{
+  if (!mp_.observed_space_enabled_)
+    return true;
+
+  // Deliberately reads the snapshot instead of re-deriving freshness. This is
+  // called once per occupancy probe from the optimizer and A* inner loops;
+  // re-deriving would read the ROS clock and expire retained observation frames
+  // thousands of times per replan, and would let observed space shrink between
+  // two cost evaluations of the same optimization. observedSpaceFresh() is the
+  // cycle boundary that refreshes it (replan entry, safety timer, trajectory
+  // validation), and an accepted visibility frame refreshes it directly.
+  if (!observed_space_fresh_snapshot_)
+    return false;
+
+  return observed_space_.isObservedWithClearance(
+      pos, mp_.observed_space_clearance_);
+}
+
+bool GridMap::clampToObservedSpace(
+    const Eigen::Vector3d &start,
+    const Eigen::Vector3d &desired,
+    double frontier_margin,
+    Eigen::Vector3d &target,
+    bool &clamped)
+{
+  if (!mp_.observed_space_enabled_)
+  {
+    target = desired;
+    clamped = false;
+    return true;
+  }
+  if (!observedSpaceFresh())
+  {
+    target = start;
+    clamped = true;
+    return false;
+  }
+  return observed_space_.clampSegment(
+      start,
+      desired,
+      mp_.observed_space_clearance_,
+      frontier_margin,
+      target,
+      clamped);
+}
+
+void GridMap::assertAbiMatchesLinkedLibrary(
+    std::size_t consumer_sizeof_grid_map,
+    const char *consumer_name)
+{
+  if (consumer_sizeof_grid_map == sizeof(GridMap))
+    return;
+
+  std::ostringstream message;
+  message
+      << "plan_env ABI mismatch: '"
+      << (consumer_name ? consumer_name : "unknown")
+      << "' was compiled against a grid_map.h with sizeof(GridMap)="
+      << consumer_sizeof_grid_map
+      << ", but libplan_env.so was built with sizeof(GridMap)="
+      << sizeof(GridMap)
+      << ". Its inlined occupancy accessors would read md_ at the wrong offset. "
+         "Rebuild every package that includes plan_env/grid_map.h "
+         "(plan_env bspline_opt path_searching traj_utils ego_planner).";
+  throw std::runtime_error(message.str());
+}
+
+int GridMap::getInflateOccupancy(const Eigen::Vector3d &pos)
+{
+  if (!isInMap(pos))
+    return mp_.observed_space_enabled_ ? 1 : -1;
+
+  if (mp_.observed_space_enabled_ && !isObservedSpaceCovered(pos))
+    return 1;
+
+  Eigen::Vector3i id;
+  posToIndex(pos, id);
+  return int(md_.occupancy_buffer_inflate_[toAddress(id)]);
 }
 
 void GridMap::publishMap()

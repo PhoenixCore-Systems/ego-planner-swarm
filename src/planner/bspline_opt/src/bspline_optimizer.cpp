@@ -54,11 +54,13 @@ namespace ego_planner
 
   void BsplineOptimizer::setEnvironment(const GridMap::Ptr &map)
   {
+    PLAN_ENV_ASSERT_GRID_MAP_ABI();
     this->grid_map_ = map;
   }
 
   void BsplineOptimizer::setEnvironment(const GridMap::Ptr &map, const fast_planner::ObjPredictor::Ptr mov_obj)
   {
+    PLAN_ENV_ASSERT_GRID_MAP_ABI();
     this->grid_map_ = map;
     this->moving_objs_ = mov_obj;
   }
