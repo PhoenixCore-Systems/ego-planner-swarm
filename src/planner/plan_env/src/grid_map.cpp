@@ -23,6 +23,8 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/local_update_range_y", -1.0);
   node_->declare_parameter("grid_map/local_update_range_z", -1.0);
   node_->declare_parameter("grid_map/obstacles_inflation", -1.0);
+  // Negative selects the legacy single-voxel vertical inflation.
+  node_->declare_parameter("grid_map/obstacles_inflation_z", -1.0);
   node_->declare_parameter("grid_map/fx", -1.0);
   node_->declare_parameter("grid_map/fy", -1.0);
   node_->declare_parameter("grid_map/cx", -1.0);
@@ -68,6 +70,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/local_update_range_y", mp_.local_update_range_(1));
   node_->get_parameter("grid_map/local_update_range_z", mp_.local_update_range_(2));
   node_->get_parameter("grid_map/obstacles_inflation", mp_.obstacles_inflation_);
+  node_->get_parameter("grid_map/obstacles_inflation_z", mp_.obstacles_inflation_z_);
   node_->get_parameter("grid_map/fx", mp_.fx_);
   node_->get_parameter("grid_map/fy", mp_.fy_);
   node_->get_parameter("grid_map/cx", mp_.cx_);
@@ -800,9 +803,9 @@ void GridMap::clearAndInflateLocalMap()
   // inflate occupied voxels to compensate robot size
 
   int inf_step = ceil(mp_.obstacles_inflation_ / mp_.resolution_);
-  // int inf_step_z = 1;
-  vector<Eigen::Vector3i> inf_pts(pow(2 * inf_step + 1, 3));
-  // inf_pts.resize(4 * inf_step + 3);
+  // This path has always inflated isotropically, so that is its legacy default.
+  int inf_step_z = verticalInflationSteps(inf_step);
+  vector<Eigen::Vector3i> inf_pts((2 * inf_step + 1) * (2 * inf_step + 1) * (2 * inf_step_z + 1));
   Eigen::Vector3i inf_pt;
 
   // clear outdated data
@@ -821,7 +824,7 @@ void GridMap::clearAndInflateLocalMap()
 
         if (md_.occupancy_buffer_[toAddress(x, y, z)] > mp_.min_occupancy_log_)
         {
-          inflatePoint(Eigen::Vector3i(x, y, z), inf_step, inf_pts);
+          inflatePoint(Eigen::Vector3i(x, y, z), inf_step, inf_step_z, inf_pts);
 
           for (int k = 0; k < (int)inf_pts.size(); ++k)
           {
@@ -958,8 +961,6 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
   pcl::PointCloud<pcl::PointXYZ> latest_cloud;
   pcl::fromROSMsg(*img, latest_cloud);
 
-  md_.has_cloud_ = true;
-
   if (!md_.has_odom_)
   {
     std::cout << "no odom!" << std::endl;
@@ -979,7 +980,9 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
   Eigen::Vector3d p3d, p3d_inf;
 
   int inf_step = ceil(mp_.obstacles_inflation_ / mp_.resolution_);
-  int inf_step_z = 1;
+  // One voxel is this path's legacy default, and the reason the collision
+  // envelope was a flat disc: 0.60 m laterally against 0.15 m vertically.
+  int inf_step_z = verticalInflationSteps(1);
 
   double max_x, max_y, max_z, min_x, min_y, min_z;
 
@@ -1061,6 +1064,12 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
         md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
       }
   }
+
+  // Commit freshness only after the independent-cloud occupancy buffer has
+  // been fully rebuilt. Consumers can therefore distinguish receipt of a
+  // cloud from completion of the map update without changing GridMap layout.
+  md_.has_cloud_ = true;
+  md_.last_occ_update_time_ = node_->now();
 }
 
 void GridMap::visibilityCallback(
@@ -1438,6 +1447,10 @@ void GridMap::publishMapInflate(bool all_info)
 }
 
 bool GridMap::odomValid() { return md_.has_odom_; }
+
+bool GridMap::cloudValid() const { return md_.has_cloud_; }
+
+rclcpp::Time GridMap::lastOccupancyUpdateTime() const { return md_.last_occ_update_time_; }
 
 bool GridMap::hasDepthObservation() { return md_.has_first_depth_; }
 

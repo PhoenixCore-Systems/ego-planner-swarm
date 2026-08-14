@@ -59,6 +59,14 @@ struct MappingParameters
   Eigen::Vector3d local_update_range_;
   double resolution_, resolution_inv_;
   double obstacles_inflation_;
+  // Vertical obstacle inflation, in metres. Historically this was hardcoded to
+  // a single voxel while the lateral figure came from obstacles_inflation_,
+  // making the collision envelope a flat disc rather than a sphere. That is
+  // tolerable for a planner that never chooses its own altitude, but a 3D
+  // search flies *over* obstacles, so its least-protected axis was the one it
+  // most needed. Negative keeps the legacy single-voxel behaviour, which is
+  // the default so EGO is bit-identical.
+  double obstacles_inflation_z_;
   string frame_id_;
   int pose_type_;
 
@@ -209,6 +217,8 @@ public:
 
   bool hasDepthObservation();
   bool odomValid();
+  bool cloudValid() const;
+  rclcpp::Time lastOccupancyUpdateTime() const;
   void getRegion(Eigen::Vector3d &ori, Eigen::Vector3d &size);
   inline double getResolution();
   Eigen::Vector3d getOrigin();
@@ -270,6 +280,9 @@ private:
   void clearAndInflateLocalMap();
 
   inline void inflatePoint(const Eigen::Vector3i &pt, int step, vector<Eigen::Vector3i> &pts);
+  inline void inflatePoint(const Eigen::Vector3i &pt, int step_xy, int step_z,
+                           vector<Eigen::Vector3i> &pts);
+  inline int verticalInflationSteps(int legacy_steps);
   int setCacheOccupancy(Eigen::Vector3d pos, int occ);
   Eigen::Vector3d closetPointInMap(const Eigen::Vector3d &pt, const Eigen::Vector3d &camera_pt);
 
@@ -500,6 +513,30 @@ inline void GridMap::inflatePoint(const Eigen::Vector3i &pt, int step, vector<Ei
       {
         pts[num++] = Eigen::Vector3i(pt(0) + x, pt(1) + y, pt(2) + z);
       }
+}
+
+inline void GridMap::inflatePoint(const Eigen::Vector3i &pt, int step_xy, int step_z,
+                                  vector<Eigen::Vector3i> &pts)
+{
+  int num = 0;
+  for (int x = -step_xy; x <= step_xy; ++x)
+    for (int y = -step_xy; y <= step_xy; ++y)
+      for (int z = -step_z; z <= step_z; ++z)
+      {
+        pts[num++] = Eigen::Vector3i(pt(0) + x, pt(1) + y, pt(2) + z);
+      }
+}
+
+// Vertical inflation in voxels. obstacles_inflation_z_ < 0 means "keep whatever
+// this call site did before the parameter existed", which each caller supplies
+// as legacy_steps -- the depth path was isotropic, the cloud path was one voxel.
+inline int GridMap::verticalInflationSteps(int legacy_steps)
+{
+  if (mp_.obstacles_inflation_z_ < 0.0)
+  {
+    return legacy_steps;
+  }
+  return std::max(0, (int)ceil(mp_.obstacles_inflation_z_ / mp_.resolution_));
 }
 
 inline double GridMap::getResolution() { return mp_.resolution_; }
