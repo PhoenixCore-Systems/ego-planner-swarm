@@ -3,8 +3,23 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
+
+namespace
+{
+// Keep the optional visualization publisher outside GridMap so adding this
+// display does not change sizeof(GridMap) and break the vendored library's ABI
+// for already-built EGO consumers. A process normally owns one GridMap; the
+// keyed registry also remains correct if a composed process owns more.
+std::mutex virtual_ceiling_publishers_mutex;
+std::unordered_map<
+  const GridMap *,
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr>
+virtual_ceiling_publishers;
+}
 
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
 // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
@@ -335,6 +350,12 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   // 发布者
   map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy", 10);
   map_inf_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy_inflate", 10);
+  {
+    std::lock_guard<std::mutex> lock(virtual_ceiling_publishers_mutex);
+    virtual_ceiling_publishers[this] =
+      node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "grid_map/virtual_ceiling_inflate", 10);
+  }
 
   md_.occ_need_update_ = false;
   md_.local_updated_ = false;
@@ -840,16 +861,30 @@ void GridMap::clearAndInflateLocalMap()
         }
       }
 
-  // add virtual ceiling to limit flight height
-  if (mp_.virtual_ceil_height_ > -0.5)
-  {
-    int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
-    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
-      {
-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
-      }
-  }
+  addInflatedVirtualCeiling();
+}
+
+void GridMap::addInflatedVirtualCeiling()
+{
+  if (mp_.virtual_ceil_height_ <= -0.5)
+    return;
+
+  // A ceiling is an infinite XY plane, so only its vertical envelope needs to
+  // be expanded. Use the same configured vertical inflation as cloud points;
+  // when no explicit Z value is configured, preserve the cloud path's legacy
+  // one-voxel envelope.
+  const int ceiling_id =
+    floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
+  const int inflation_z = verticalInflationSteps(1);
+  const int minimum_z = std::max(md_.local_bound_min_(2), ceiling_id - inflation_z);
+  const int maximum_z = std::min(md_.local_bound_max_(2), ceiling_id + inflation_z);
+  if (minimum_z > maximum_z)
+    return;
+
+  for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
+    for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
+      for (int z = minimum_z; z <= maximum_z; ++z)
+        md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 1;
 }
 
 void GridMap::visCallback()
@@ -1055,15 +1090,7 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
   boundIndex(md_.local_bound_min_);
   boundIndex(md_.local_bound_max_);
 
-  // add virtual ceiling to limit flight height
-  // 添加虚拟天花板控制飞行高度
-  if (mp_.virtual_ceil_height_ > -0.5) {
-    int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
-    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y) {
-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
-      }
-  }
+  addInflatedVirtualCeiling();
 
   // Commit freshness only after the independent-cloud occupancy buffer has
   // been fully rebuilt. Consumers can therefore distinguish receipt of a
@@ -1396,12 +1423,22 @@ void GridMap::publishMap()
 
 void GridMap::publishMapInflate(bool all_info)
 {
-
-  if (map_inf_pub_->get_subscription_count()<= 0)
+  const bool publish_obstacles = map_inf_pub_->get_subscription_count() > 0;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr ceiling_publisher;
+  {
+    std::lock_guard<std::mutex> lock(virtual_ceiling_publishers_mutex);
+    const auto publisher = virtual_ceiling_publishers.find(this);
+    if (publisher != virtual_ceiling_publishers.end())
+      ceiling_publisher = publisher->second;
+  }
+  const bool publish_ceiling =
+    ceiling_publisher && ceiling_publisher->get_subscription_count() > 0;
+  if (!publish_obstacles && !publish_ceiling)
     return;
 
   pcl::PointXYZ pt;
-  pcl::PointCloud<pcl::PointXYZ> cloud;
+  pcl::PointCloud<pcl::PointXYZ> obstacle_cloud;
+  pcl::PointCloud<pcl::PointXYZ> ceiling_cloud;
 
   Eigen::Vector3i min_cut = md_.local_bound_min_;
   Eigen::Vector3i max_cut = md_.local_bound_max_;
@@ -1415,6 +1452,17 @@ void GridMap::publishMapInflate(bool all_info)
 
   boundIndex(min_cut);
   boundIndex(max_cut);
+
+  int ceiling_min_z = 1;
+  int ceiling_max_z = 0;
+  if (mp_.virtual_ceil_height_ > -0.5)
+  {
+    const int ceiling_id =
+      floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
+    const int inflation_z = verticalInflationSteps(1);
+    ceiling_min_z = ceiling_id - inflation_z;
+    ceiling_max_z = ceiling_id + inflation_z;
+  }
 
   for (int x = min_cut(0); x <= max_cut(0); ++x)
     for (int y = min_cut(1); y <= max_cut(1); ++y)
@@ -1431,17 +1479,28 @@ void GridMap::publishMapInflate(bool all_info)
         pt.x = pos(0);
         pt.y = pos(1);
         pt.z = pos(2);
-        cloud.push_back(pt);
+        if (z >= ceiling_min_z && z <= ceiling_max_z)
+          ceiling_cloud.push_back(pt);
+        else
+          obstacle_cloud.push_back(pt);
       }
 
-  cloud.width = cloud.points.size();
-  cloud.height = 1;
-  cloud.is_dense = true;
-  cloud.header.frame_id = mp_.frame_id_;
-  sensor_msgs::msg::PointCloud2 cloud_msg;
-
-  pcl::toROSMsg(cloud, cloud_msg);
-  map_inf_pub_->publish(cloud_msg);
+  const auto publish_cloud = [this](
+      pcl::PointCloud<pcl::PointXYZ> & cloud,
+      const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & publisher)
+    {
+      cloud.width = cloud.points.size();
+      cloud.height = 1;
+      cloud.is_dense = true;
+      cloud.header.frame_id = mp_.frame_id_;
+      sensor_msgs::msg::PointCloud2 cloud_msg;
+      pcl::toROSMsg(cloud, cloud_msg);
+      publisher->publish(cloud_msg);
+    };
+  if (publish_obstacles)
+    publish_cloud(obstacle_cloud, map_inf_pub_);
+  if (publish_ceiling)
+    publish_cloud(ceiling_cloud, ceiling_publisher);
 
   // RCLCPP_INFO(rclcpp::get_logger("publishMapInflate"), "pub map");
 }

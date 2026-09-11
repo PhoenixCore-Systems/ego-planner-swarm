@@ -278,6 +278,7 @@ private:
   void projectDepthImage();
   void raycastProcess();
   void clearAndInflateLocalMap();
+  void addInflatedVirtualCeiling();
 
   inline void inflatePoint(const Eigen::Vector3i &pt, int step, vector<Eigen::Vector3i> &pts);
   inline void inflatePoint(const Eigen::Vector3i &pt, int step_xy, int step_z,

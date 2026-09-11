@@ -15,6 +15,9 @@ def generate_launch_description():
     camera_pose_topic = LaunchConfiguration('camera_pose_topic', default='camera_pose')
     depth_topic = LaunchConfiguration('depth_topic', default='depth_image')
     cloud_topic = LaunchConfiguration('cloud_topic', default='cloud')
+    goal_topic = LaunchConfiguration('goal_topic')
+    bspline_topic = LaunchConfiguration('bspline_topic')
+    cancel_service = LaunchConfiguration('cancel_service')
     
     cx = LaunchConfiguration('cx', default=321.04638671875)
     cy = LaunchConfiguration('cy', default=243.44969177246094)
@@ -126,6 +129,14 @@ def generate_launch_description():
     camera_pose_topic_arg = DeclareLaunchArgument('camera_pose_topic', default_value=camera_pose_topic, description='Camera pose topic')
     depth_topic_arg = DeclareLaunchArgument('depth_topic', default_value=depth_topic, description='Depth topic')
     cloud_topic_arg = DeclareLaunchArgument('cloud_topic', default_value=cloud_topic, description='Point cloud topic')
+    goal_topic_arg = DeclareLaunchArgument(
+        'goal_topic', default_value='/move_base_simple/goal', description='Manual target PoseStamped topic')
+    bspline_topic_arg = DeclareLaunchArgument(
+        'bspline_topic', default_value=['drone_', drone_id, '_planning/bspline'],
+        description='Position B-spline output topic')
+    cancel_service_arg = DeclareLaunchArgument(
+        'cancel_service', default_value=['drone_', drone_id, '_planning/cancel'],
+        description='Planner cancellation service')
     cx_arg = DeclareLaunchArgument('cx', default_value=cx, description='Camera intrinsic cx')
     cy_arg = DeclareLaunchArgument('cy', default_value=cy, description='Camera intrinsic cy')
     fx_arg = DeclareLaunchArgument('fx', default_value=fx, description='Camera intrinsic fx')
@@ -357,8 +368,9 @@ def generate_launch_description():
         output='screen',
         remappings=[
             ('odom_world', ['drone_', drone_id, '_', odometry_topic]),
-            ('planning/bspline', ['drone_', drone_id, '_planning/bspline']),
-            ('planning/cancel', ['drone_', drone_id, '_planning/cancel']),
+            ('/move_base_simple/goal', goal_topic),
+            ('planning/bspline', bspline_topic),
+            ('planning/cancel', cancel_service),
             ('planning/data_display', ['drone_', drone_id, '_planning/data_display']),
             ('planning/broadcast_bspline_from_planner', '/broadcast_bspline'),
             ('planning/broadcast_bspline_to_planner', '/broadcast_bspline'),
@@ -516,6 +528,9 @@ def generate_launch_description():
     ld.add_action(camera_pose_topic_arg)
     ld.add_action(depth_topic_arg)
     ld.add_action(cloud_topic_arg)
+    ld.add_action(goal_topic_arg)
+    ld.add_action(bspline_topic_arg)
+    ld.add_action(cancel_service_arg)
     ld.add_action(cx_arg)
     ld.add_action(cy_arg)
     ld.add_action(fx_arg)
