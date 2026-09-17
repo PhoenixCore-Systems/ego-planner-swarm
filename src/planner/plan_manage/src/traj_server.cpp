@@ -1,5 +1,6 @@
 #include "bspline_opt/uniform_bspline.h"
 #include "nav_msgs/msg/odometry.hpp"
+#include "nav_msgs/msg/path.hpp"
 #include "traj_utils/msg/bspline.hpp"
 #include "quadrotor_msgs/msg/position_command.hpp"
 #include "std_msgs/msg/empty.hpp"
@@ -8,7 +9,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <string>
+#include <stdexcept>
 #include <utility>
 
 rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
@@ -25,11 +28,13 @@ vector<UniformBspline> traj_;
 double traj_duration_;
 rclcpp::Time start_time_;
 int traj_id_;
-bool receive_scheduled_traj_ = false;
-vector<UniformBspline> scheduled_traj_;
-double scheduled_traj_duration_;
-rclcpp::Time scheduled_start_time_;
-int scheduled_traj_id_;
+struct ScheduledTrajectory {
+  vector<UniformBspline> curves;
+  double duration;
+  rclcpp::Time start;
+  int id;
+};
+std::deque<ScheduledTrajectory> scheduled_trajectories_;
 
 // yaw control
 double last_yaw_, last_yaw_dot_;
@@ -38,6 +43,83 @@ std::string output_frame_ = "world";
 double max_start_past_sec_ = 1.0;
 double max_start_future_sec_ = 2.0;
 double scheduled_start_threshold_sec_ = 0.20;
+double commitment_horizon_sec_ = 2.5;
+rclcpp::Time committed_until_(0, 0, RCL_ROS_TIME);
+rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr committed_path_pub_;
+rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr accepted_tail_pub_;
+
+// Select from the complete accepted reference, including queued pieces that
+// are already partly protected. Never replace those pieces wholesale.
+void referenceAt(const rclcpp::Time & stamp, vector<UniformBspline> *& curves,
+  rclcpp::Time & origin, double & duration)
+{
+  curves = &traj_;
+  origin = start_time_;
+  duration = traj_duration_;
+  for (auto & piece : scheduled_trajectories_) {
+    if (piece.start > stamp) break;
+    curves = &piece.curves;
+    origin = piece.start;
+    duration = piece.duration;
+  }
+}
+
+// The accepted reference is piecewise: active up to the scheduled join,
+// followed by the queued spline. Advance protection at the command cadence,
+// independently of search cadence and spline-ID promotion.
+void publishCommittedWindow(const rclcpp::Time & stamp)
+{
+  const double coverage = !scheduled_trajectories_.empty() ?
+    (scheduled_trajectories_.back().start - stamp).seconds() + scheduled_trajectories_.back().duration :
+    (start_time_ - stamp).seconds() + traj_duration_;
+  const double horizon = std::max(0.0, std::min(commitment_horizon_sec_, coverage));
+  committed_until_ = stamp + rclcpp::Duration::from_seconds(horizon);
+  nav_msgs::msg::Path path;
+  path.header.stamp = stamp;
+  path.header.frame_id = output_frame_;
+  const int samples = std::max(1, static_cast<int>(std::ceil(horizon / 0.05)));
+  for (int i = 0; i <= samples; ++i) {
+    const auto sample_stamp = stamp + rclcpp::Duration::from_seconds(horizon * i / samples);
+    vector<UniformBspline> * curves;
+    rclcpp::Time origin = start_time_;
+    double duration;
+    referenceAt(sample_stamp, curves, origin, duration);
+    const auto point = (*curves)[0].evaluateDeBoorT(std::clamp((sample_stamp - origin).seconds(), 0.0, duration));
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = path.header;
+    pose.header.stamp = sample_stamp;
+    pose.pose.position.x = point.x();
+    pose.pose.position.y = point.y();
+    pose.pose.position.z = point.z();
+    pose.pose.orientation.w = 1.0;
+    path.poses.push_back(pose);
+  }
+  committed_path_pub_->publish(path);
+  // Publish from exactly the same boundary and snapshot as the magenta path.
+  // This includes the formerly hidden segment before a future candidate join.
+  nav_msgs::msg::Path tail;
+  tail.header = path.header;
+  const double tail_duration = std::max(0.0, coverage - horizon);
+  const int tail_samples = std::max(1, static_cast<int>(std::ceil(tail_duration / 0.05)));
+  for (int i = 0; i <= tail_samples; ++i) {
+    const auto sample_stamp = committed_until_ +
+      rclcpp::Duration::from_seconds(tail_duration * i / tail_samples);
+    vector<UniformBspline> * curves;
+    rclcpp::Time origin = start_time_;
+    double duration;
+    referenceAt(sample_stamp, curves, origin, duration);
+    const auto point = (*curves)[0].evaluateDeBoorT(std::clamp((sample_stamp - origin).seconds(), 0.0, duration));
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = tail.header;
+    pose.header.stamp = sample_stamp;
+    pose.pose.position.x = point.x();
+    pose.pose.position.y = point.y();
+    pose.pose.position.z = point.z();
+    pose.pose.orientation.w = 1.0;
+    tail.poses.push_back(pose);
+  }
+  accepted_tail_pub_->publish(tail);
+}
 
 bool validateBsplineMessage(
   const traj_utils::msg::Bspline & msg,
@@ -179,15 +261,37 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
   const double start_offset = (requested_start - node_clock->now()).seconds();
   if (receive_traj_ && start_offset > scheduled_start_threshold_sec_)
   {
-    scheduled_traj_ = std::move(parsed);
-    scheduled_traj_duration_ = scheduled_traj_[0].getTimeSum();
-    scheduled_start_time_ = requested_start;
-    scheduled_traj_id_ = msg->traj_id;
-    receive_scheduled_traj_ = true;
+    // Routine continuation must preserve all motion committed on prior ticks.
+    vector<UniformBspline> * reference;
+    rclcpp::Time origin = start_time_;
+    double duration;
+    referenceAt(requested_start, reference, origin, duration);
+    const double join = (requested_start - origin).seconds();
+    if (requested_start < committed_until_ ||
+        start_offset < commitment_horizon_sec_ || join < 0.0 || join > duration) {
+      RCLCPP_ERROR(rclcpp::get_logger("traj_server"),
+        "Rejected continuation that overwrites commitment or leaves a reference gap");
+      return;
+    }
+    for (int derivative = 0; derivative < 3; ++derivative) {
+      const double tolerance = derivative == 2 ? 0.05 : 0.02;
+      if (((*reference)[derivative].evaluateDeBoorT(join) -
+          parsed[derivative].evaluateDeBoorT(0.0)).norm() > tolerance) {
+        RCLCPP_ERROR(rclcpp::get_logger("traj_server"), "Rejected non-C2 continuation");
+        return;
+      }
+    }
+    while (!scheduled_trajectories_.empty() &&
+      scheduled_trajectories_.back().start >= requested_start) {
+      scheduled_trajectories_.pop_back();
+    }
+    const double parsed_duration = parsed[0].getTimeSum();
+    scheduled_trajectories_.push_back(
+      {std::move(parsed), parsed_duration, requested_start, static_cast<int>(msg->traj_id)});
     RCLCPP_INFO(
       rclcpp::get_logger("traj_server"),
       "Scheduled trajectory %d in %.3f s while trajectory %d remains active",
-      scheduled_traj_id_, start_offset, traj_id_);
+      static_cast<int>(msg->traj_id), start_offset, traj_id_);
     return;
   }
 
@@ -199,8 +303,10 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
   start_time_ = requested_start;
   traj_id_ = msg->traj_id;
   receive_traj_ = true;
-  receive_scheduled_traj_ = false;
-  scheduled_traj_.clear();
+  scheduled_trajectories_.clear();
+  // Immediate trajectories include certified safety stops/recoveries. They
+  // deliberately supersede the old commitment; routine updates use the queue.
+  committed_until_ = requested_start;
 }
 
 std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclcpp::Time &time_now, rclcpp::Time &time_last)
@@ -302,14 +408,14 @@ void cmdCallback()
   if (!node_clock)
     return;
   rclcpp::Time time_now = node_clock->now();
-  if (receive_scheduled_traj_ && time_now >= scheduled_start_time_)
+  while (!scheduled_trajectories_.empty() && time_now >= scheduled_trajectories_.front().start)
   {
-    traj_ = std::move(scheduled_traj_);
-    traj_duration_ = scheduled_traj_duration_;
-    start_time_ = scheduled_start_time_;
-    traj_id_ = scheduled_traj_id_;
-    receive_scheduled_traj_ = false;
-    scheduled_traj_.clear();
+    auto & next = scheduled_trajectories_.front();
+    traj_ = std::move(next.curves);
+    traj_duration_ = next.duration;
+    start_time_ = next.start;
+    traj_id_ = next.id;
+    scheduled_trajectories_.pop_front();
   }
   /* no publishing before receive traj_ */
   if (!receive_traj_)
@@ -323,6 +429,8 @@ void cmdCallback()
   // none exists) until this trajectory becomes active.
   if (t_cur < 0.0)
     return;
+
+  publishCommittedWindow(time_now);
 
   Eigen::Vector3d pos(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero()), pos_f;
   std::pair<double, double> yaw_yawdot(0, 0);
@@ -385,6 +493,11 @@ int main(int argc, char **argv)
   rclcpp::init(argc, argv);
   auto node = rclcpp::Node::make_shared("traj_server");
   node_clock = node->get_clock();
+  committed_until_ = rclcpp::Time(0, 0, node_clock->get_clock_type());
+  committed_path_pub_ = node->create_publisher<nav_msgs::msg::Path>(
+    "planning/committed_path", rclcpp::QoS(1).reliable().transient_local());
+  accepted_tail_pub_ = node->create_publisher<nav_msgs::msg::Path>(
+    "planning/accepted_tail", rclcpp::QoS(1).reliable().transient_local());
 
   auto bspline_sub = node->create_subscription<traj_utils::msg::Bspline>(
       "planning/bspline",
@@ -419,6 +532,10 @@ int main(int argc, char **argv)
   node->declare_parameter("traj_server/scheduled_start_threshold_sec", 0.20);
   node->get_parameter(
     "traj_server/scheduled_start_threshold_sec", scheduled_start_threshold_sec_);
+  commitment_horizon_sec_ = node->declare_parameter("traj_server/commitment_horizon_sec", 2.5);
+  if (!std::isfinite(commitment_horizon_sec_) || commitment_horizon_sec_ <= 0.0) {
+    throw std::invalid_argument("commitment_horizon_sec must be finite and positive");
+  }
 
   last_yaw_ = 0.0;
   last_yaw_dot_ = 0.0;
