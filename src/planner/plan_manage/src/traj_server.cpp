@@ -508,9 +508,14 @@ int main(int argc, char **argv)
       "/position_cmd",
       50);
 
+  const double command_rate_hz = node->declare_parameter("traj_server/command_rate_hz", 100.0);
+  if (!std::isfinite(command_rate_hz) || command_rate_hz <= 0.0) {
+    throw std::invalid_argument("command_rate_hz must be finite and positive");
+  }
   auto cmd_timer = node->create_wall_timer(
-      std::chrono::milliseconds(10),
+      std::chrono::duration<double>(1.0 / command_rate_hz),
       cmdCallback);
+  RCLCPP_INFO(node->get_logger(), "Trajectory sampler rate: %.1f Hz", command_rate_hz);
 
   /* control parameter */
   cmd.kx[0] = pos_gain[0];

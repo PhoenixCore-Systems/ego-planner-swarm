@@ -210,6 +210,14 @@ public:
 
   void initMap(rclcpp::Node::SharedPtr node);
 
+  // Owner-fed input (grid_map/external_input: true). The owning node already
+  // subscribes to odometry and to the map-frame cloud, so GridMap opens no
+  // subscriptions or occupancy timer of its own: each cloud is decoded once,
+  // by the owner, and the same points can feed the owner's other consumers.
+  // Semantics match the independent cloud/odometry callbacks.
+  void setExternalOdometry(const Eigen::Vector3d &position);
+  void insertExternalCloud(const std::vector<Eigen::Vector3d> &points);
+
   void publishMap();
   void publishMapInflate(bool all_info = false);
 
@@ -269,6 +277,10 @@ private:
       const sensor_msgs::msg::PointCloud2::ConstPtr &cloud,
       const geometry_msgs::msg::PointStamped::ConstPtr &origin);
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom);
+  // Shared by cloudCallback and insertExternalCloud. A member template adds no
+  // data, so sizeof(GridMap) (the ABI guard below) is unchanged.
+  template <typename Points>
+  void insertIndependentCloud(const Points &points);
 
   // update occupancy by raycasting
   void updateOccupancyCallback();

@@ -58,6 +58,8 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/p_occ", 0.80);
   node_->declare_parameter("grid_map/min_ray_length", -0.1);
   node_->declare_parameter("grid_map/max_ray_length", -0.1);
+  // Read here only, so this mode adds no member to the ABI-guarded layout.
+  const bool external_input = node_->declare_parameter("grid_map/external_input", false);
   node_->declare_parameter("grid_map/visualization_truncate_height", -0.1);
   node_->declare_parameter("grid_map/virtual_ceil_height", -0.1);
   node_->declare_parameter("grid_map/virtual_ceil_yp", -0.1);
@@ -258,41 +260,51 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
 
   /* init callback */
 
-  // 初始化 message_filters::Subscriber
-  depth_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
-      node_, "grid_map/depth", rclcpp::QoS(50).get_rmw_qos_profile());
-
-  extrinsic_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
-      "/vins_estimator/extrinsic", 10,
-      std::bind(&GridMap::extrinsicCallback, this, std::placeholders::_1));
-
-  if (mp_.pose_type_ == POSE_STAMPED)
+  if (external_input)
   {
-    pose_sub_ = std::make_shared<message_filters::Subscriber<geometry_msgs::msg::PoseStamped>>(
-        node_, "grid_map/pose", rclcpp::QoS(25).get_rmw_qos_profile());
-
-    sync_image_pose_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImagePose>>(
-        SyncPolicyImagePose(100), *depth_sub_, *pose_sub_);
-    sync_image_pose_->registerCallback(
-        std::bind(&GridMap::depthPoseCallback, this, std::placeholders::_1, std::placeholders::_2));
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "GridMap external input: the owning node feeds odometry and cloud points; "
+        "no GridMap odometry/cloud/depth subscriptions or occupancy timer");
   }
-  else if (mp_.pose_type_ == ODOMETRY)
+  else
   {
-    odom_sub_ = std::make_shared<message_filters::Subscriber<nav_msgs::msg::Odometry>>(
-        node_, "grid_map/odom", rclcpp::QoS(100).get_rmw_qos_profile());
+    // 初始化 message_filters::Subscriber
+    depth_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
+        node_, "grid_map/depth", rclcpp::QoS(50).get_rmw_qos_profile());
 
-    sync_image_odom_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImageOdom>>(
-        SyncPolicyImageOdom(100), *depth_sub_, *odom_sub_);
-    sync_image_odom_->registerCallback(
-        std::bind(&GridMap::depthOdomCallback, this, std::placeholders::_1, std::placeholders::_2));
+    extrinsic_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
+        "/vins_estimator/extrinsic", 10,
+        std::bind(&GridMap::extrinsicCallback, this, std::placeholders::_1));
+
+    if (mp_.pose_type_ == POSE_STAMPED)
+    {
+      pose_sub_ = std::make_shared<message_filters::Subscriber<geometry_msgs::msg::PoseStamped>>(
+          node_, "grid_map/pose", rclcpp::QoS(25).get_rmw_qos_profile());
+
+      sync_image_pose_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImagePose>>(
+          SyncPolicyImagePose(100), *depth_sub_, *pose_sub_);
+      sync_image_pose_->registerCallback(
+          std::bind(&GridMap::depthPoseCallback, this, std::placeholders::_1, std::placeholders::_2));
+    }
+    else if (mp_.pose_type_ == ODOMETRY)
+    {
+      odom_sub_ = std::make_shared<message_filters::Subscriber<nav_msgs::msg::Odometry>>(
+          node_, "grid_map/odom", rclcpp::QoS(100).get_rmw_qos_profile());
+
+      sync_image_odom_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImageOdom>>(
+          SyncPolicyImageOdom(100), *depth_sub_, *odom_sub_);
+      sync_image_odom_->registerCallback(
+          std::bind(&GridMap::depthOdomCallback, this, std::placeholders::_1, std::placeholders::_2));
+    }
+
+    // 使用独立的里程计和点云订阅
+    indep_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+        "grid_map/cloud", 10, std::bind(&GridMap::cloudCallback, this, std::placeholders::_1));
+
+    indep_odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
+        "grid_map/odom", 10, std::bind(&GridMap::odomCallback, this, std::placeholders::_1));
   }
-
-  // 使用独立的里程计和点云订阅
-  indep_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "grid_map/cloud", 10, std::bind(&GridMap::cloudCallback, this, std::placeholders::_1));
-
-  indep_odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
-      "grid_map/odom", 10, std::bind(&GridMap::odomCallback, this, std::placeholders::_1));
 
   if (mp_.observed_space_enabled_)
   {
@@ -339,9 +351,13 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   }
 
   // 定时器
-  occ_timer_ = node_->create_wall_timer(
-      std::chrono::duration<double>(0.05),
-      std::bind(&GridMap::updateOccupancyCallback, this));
+  // Depth fusion only: owner-fed clouds commit in insertExternalCloud.
+  if (!external_input)
+  {
+    occ_timer_ = node_->create_wall_timer(
+        std::chrono::duration<double>(0.05),
+        std::bind(&GridMap::updateOccupancyCallback, this));
+  }
 
   vis_timer_ = node_->create_wall_timer(
       std::chrono::duration<double>(0.11),
@@ -990,19 +1006,29 @@ void GridMap::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
   md_.has_odom_ = true;
 }
 
-void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
+namespace
 {
+inline Eigen::Vector3d cloudPoint(const pcl::PointXYZ &pt)
+{
+  return Eigen::Vector3d(pt.x, pt.y, pt.z);
+}
 
-  pcl::PointCloud<pcl::PointXYZ> latest_cloud;
-  pcl::fromROSMsg(*img, latest_cloud);
+inline const Eigen::Vector3d &cloudPoint(const Eigen::Vector3d &pt)
+{
+  return pt;
+}
+}  // namespace
 
+template <typename Points>
+void GridMap::insertIndependentCloud(const Points &points)
+{
   if (!md_.has_odom_)
   {
     std::cout << "no odom!" << std::endl;
     return;
   }
 
-  if (latest_cloud.points.size() == 0)
+  if (points.size() == 0)
     return;
 
   if (isnan(md_.camera_pos_(0)) || isnan(md_.camera_pos_(1)) || isnan(md_.camera_pos_(2)))
@@ -1011,7 +1037,6 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
   this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
                     md_.camera_pos_ + mp_.local_update_range_);
 
-  pcl::PointXYZ pt;
   Eigen::Vector3d p3d, p3d_inf;
 
   int inf_step = ceil(mp_.obstacles_inflation_ / mp_.resolution_);
@@ -1029,10 +1054,9 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
   max_y = mp_.map_min_boundary_(1);
   max_z = mp_.map_min_boundary_(2);
 
-  for (size_t i = 0; i < latest_cloud.points.size(); ++i)
+  for (const auto &point : points)
   {
-    pt = latest_cloud.points[i];
-    p3d(0) = pt.x, p3d(1) = pt.y, p3d(2) = pt.z;
+    p3d = cloudPoint(point);
 
     /* point inside update range */
     Eigen::Vector3d devi = p3d - md_.camera_pos_;
@@ -1049,9 +1073,9 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
           for (int z = -inf_step_z; z <= inf_step_z; ++z)
           {
 
-            p3d_inf(0) = pt.x + x * mp_.resolution_;
-            p3d_inf(1) = pt.y + y * mp_.resolution_;
-            p3d_inf(2) = pt.z + z * mp_.resolution_;
+            p3d_inf(0) = p3d(0) + x * mp_.resolution_;
+            p3d_inf(1) = p3d(1) + y * mp_.resolution_;
+            p3d_inf(2) = p3d(2) + z * mp_.resolution_;
 
             max_x = max(max_x, p3d_inf(0));
             max_y = max(max_y, p3d_inf(1));
@@ -1097,6 +1121,24 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
   // cloud from completion of the map update without changing GridMap layout.
   md_.has_cloud_ = true;
   md_.last_occ_update_time_ = node_->now();
+}
+
+void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
+{
+  pcl::PointCloud<pcl::PointXYZ> latest_cloud;
+  pcl::fromROSMsg(*img, latest_cloud);
+  insertIndependentCloud(latest_cloud.points);
+}
+
+void GridMap::insertExternalCloud(const std::vector<Eigen::Vector3d> &points)
+{
+  insertIndependentCloud(points);
+}
+
+void GridMap::setExternalOdometry(const Eigen::Vector3d &position)
+{
+  md_.camera_pos_ = position;
+  md_.has_odom_ = true;
 }
 
 void GridMap::visibilityCallback(
